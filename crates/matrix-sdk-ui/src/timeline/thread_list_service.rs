@@ -353,7 +353,7 @@ impl ThreadListService {
         Ok(ThreadList { items: list_items, prev_batch_token: thread_roots.prev_batch_token })
     }
 
-    async fn build_thread_list_item(
+    pub(crate) async fn build_thread_list_item(
         room: &Room,
         timeline_event: TimelineEvent,
     ) -> Option<ThreadListItem> {

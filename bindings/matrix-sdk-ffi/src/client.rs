@@ -1810,6 +1810,25 @@ impl Client {
         Ok(Arc::new(NotificationClient { inner, client: self.clone() }))
     }
 
+    /// Exhaustively discover threads across joined rooms. Call after the first
+    /// sync; `None` loads the whole account, a list reloads changed rooms.
+    /// No partial result is returned when a room or page fails.
+    pub async fn load_thread_inbox(
+        &self,
+        room_ids: Option<Vec<String>>,
+    ) -> Result<Vec<crate::thread_inbox::ThreadInboxRoom>, ClientError> {
+        crate::thread_inbox::load(&self.inner, room_ids).await
+    }
+
+    /// Observe all rooms, including receipt-only sync updates. Subscribe before
+    /// loading the first inbox snapshot to avoid losing concurrent changes.
+    pub fn subscribe_to_thread_inbox_updates(
+        &self,
+        listener: Box<dyn crate::thread_inbox::ThreadInboxListener>,
+    ) -> Arc<TaskHandle> {
+        crate::thread_inbox::subscribe(&self.inner, listener)
+    }
+
     pub fn sync_service(&self) -> Arc<SyncServiceBuilder> {
         SyncServiceBuilder::new((*self.inner).clone(), self.utd_hook_manager.get().cloned())
     }
