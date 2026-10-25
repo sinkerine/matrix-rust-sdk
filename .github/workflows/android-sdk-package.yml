@@ -1,0 +1,123 @@
+name: Publish custom Android Rust SDK
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/custom'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CARGO_TERM_COLOR: always
+      NDK_VERSION: 29.0.14206865
+
+    steps:
+      - name: Checkout Rust SDK source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned Kotlin components
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: matrix-org/matrix-rust-components-kotlin
+          ref: 93488b7a668e2cd5752b85d59da4f81d791e87b2
+          path: matrix-rust-components-kotlin
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android SDK
+        uses: malinskiy/action-android/install-sdk@fa103ef30331e95f266418a6a97e98f61f626887 # release/0.1.7
+
+      - name: Install pinned Android NDK
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager --install "ndk;$NDK_VERSION"
+          ndk_path="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          test -d "$ndk_path"
+          grep -Fxq "Pkg.Revision = $NDK_VERSION" "$ndk_path/source.properties"
+          echo "ANDROID_NDK=$ndk_path" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk_path" >> "$GITHUB_ENV"
+
+      - name: Install pinned Rust toolchain and Android targets
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --version 3.5.4 --locked
+
+      - name: Set custom immutable Maven version
+        working-directory: matrix-rust-components-kotlin
+        run: sed -i 's/patchVersion = "9"/patchVersion = "9-custom.1"/' buildSrc/src/main/kotlin/BuildVersionsSDK.kt
+
+      - name: Refuse to replace an existing Maven version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status=$(curl --silent --show-error --output "$RUNNER_TEMP/package-versions.json" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/users/15cm/packages/maven/org.matrix.rustcomponents%3Asdk-android/versions')
+          if [ "$status" = 200 ]; then
+            if jq -e '.[] | select(.name == "26.09.9-custom.1")' \
+              "$RUNNER_TEMP/package-versions.json" >/dev/null; then
+              echo 'Maven version 26.09.9-custom.1 already exists; refusing replacement.' >&2
+              exit 1
+            fi
+          elif [ "$status" != 404 ]; then
+            echo "Unable to verify package versions (HTTP $status); refusing publication." >&2
+            cat "$RUNNER_TEMP/package-versions.json" >&2
+            exit 1
+          fi
+
+      - name: Build release AAR for all Android ABIs
+        working-directory: matrix-rust-components-kotlin
+        run: ./scripts/build.sh -r -p "$GITHUB_WORKSPACE" -o "$RUNNER_TEMP/sdk-android-release.aar"
+
+      - name: Publish Maven package to this fork
+        working-directory: matrix-rust-components-kotlin
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > "$RUNNER_TEMP/github-packages.init.gradle" <<'EOF'
+          gradle.projectsEvaluated {
+              def sdk = gradle.rootProject.findProject(':sdk:sdk-android')
+              if (sdk != null) {
+                  sdk.publishing.repositories.maven {
+                      name = 'GitHubPackages'
+                      url = uri('https://maven.pkg.github.com/15cm/matrix-rust-sdk')
+                      credentials {
+                          username = System.getenv('GITHUB_ACTOR')
+                          password = System.getenv('GITHUB_TOKEN')
+                      }
+                  }
+                  sdk.tasks.withType(org.gradle.plugins.signing.Sign).configureEach {
+                      enabled = false
+                  }
+              }
+          }
+          EOF
+          ./gradlew --no-daemon --stacktrace -I "$RUNNER_TEMP/github-packages.init.gradle" \
+            :sdk:sdk-android:publishReleasePublicationToGitHubPackagesRepository
+
+      - name: Save release AAR
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdk-android-26.09.9-custom.1
+          path: ${{ runner.temp }}/sdk-android-release.aar
+          if-no-files-found: error
