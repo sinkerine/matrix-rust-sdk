@@ -44,7 +44,10 @@ use tracing::{debug, instrument};
 
 use crate::{
     OpenStoreError, RuntimeConfig, Secret, SqliteStoreConfig,
-    connection::{self, Connection as SqliteAsyncConn, Pool as SqlitePool, SqliteConnections},
+    connection::{
+        self, Connection as SqliteAsyncConn, Pool as SqlitePool, SqliteConnections,
+        SqliteConnectionsInner,
+    },
     error::{Error, Result},
     utils::{
         EncryptableStore, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
@@ -70,7 +73,7 @@ pub struct SqliteMediaStore {
     store_cipher: Option<Arc<StoreCipher>>,
 
     /// `Some` when active, `None` when closed.
-    connections: Arc<Mutex<Option<SqliteConnections>>>,
+    connections: Arc<SqliteConnections>,
 
     /// Retained so we can rebuild the pool on reopen.
     db_path: PathBuf,
@@ -167,7 +170,7 @@ impl SqliteMediaStore {
         let last_media_cleanup_time = conn.get_serialized_kv(keys::LAST_MEDIA_CLEANUP_TIME).await?;
         media_service.restore(media_retention_policy, last_media_cleanup_time);
 
-        let connections = SqliteConnections {
+        let connections = SqliteConnectionsInner {
             pool,
             // Use `conn` as our selected write connection.
             write_connection: Arc::new(Mutex::new(conn)),
@@ -175,7 +178,7 @@ impl SqliteMediaStore {
 
         Ok(Self {
             store_cipher,
-            connections: Arc::new(Mutex::new(Some(connections))),
+            connections: Arc::new(SqliteConnections::new(connections).await),
             db_path,
             pool_config,
             runtime_config,
@@ -608,7 +611,8 @@ impl MediaStoreInner for SqliteMediaStore {
                     }
                 }
 
-                // Finally, if the cache size is too big, remove old items until it fits.
+                // Finally, if the cache size is too big, remove old items until
+                // it fits.
                 if let Some(max_cache_size) = policy.max_cache_size {
                     // i64 is the integer type used by SQLite, use it here to
                     // avoid usize overflow during the conversion of the result.
@@ -623,9 +627,11 @@ impl MediaStoreInner for SqliteMediaStore {
                         )?
                         .unwrap_or_default();
 
-                    // If the cache size is overflowing or bigger than max cache size, clean up.
+                    // If the cache size is overflowing or bigger than max cache
+                    // size, clean up.
                     if cache_size > max_cache_size {
-                        // Get the sizes of the media contents ordered by last access.
+                        // Get the sizes of the media contents ordered by last
+                        // access.
                         let mut cached_stmt = txn.prepare_cached(
                             "SELECT rowid, length(data) FROM media \
                              WHERE ignore_policy IS FALSE ORDER BY last_access DESC",

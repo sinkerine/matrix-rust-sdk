@@ -52,12 +52,11 @@ use ruma::{
     },
     profile::UserProfileUpdate,
     push::Ruleset,
-    time::Instant,
 };
 use tokio::sync::{Mutex, MutexGuard, broadcast};
 #[cfg(feature = "e2e-encryption")]
 use tokio::sync::{RwLock, RwLockReadGuard};
-use tracing::{Level, debug, enabled, info, instrument, warn};
+use tracing::{Level, debug, info, instrument, warn};
 
 #[cfg(feature = "e2e-encryption")]
 use crate::RoomMemberships;
@@ -125,7 +124,7 @@ pub struct BaseClient {
     olm_machine: Arc<RwLock<Option<OlmMachine>>>,
 
     /// Observable of when a user is ignored/unignored.
-    pub(crate) ignore_user_list_changes: SharedObservable<Vec<String>>,
+    pub(crate) ignore_user_list_changes: SharedObservable<Vec<OwnedUserId>>,
 
     /// Broadcasts the user IDs whose global profile changed during a sync.
     /// Requires the Profiles sliding sync extension to be enabled.
@@ -386,7 +385,8 @@ impl BaseClient {
     ///
     /// - `session_meta` - The meta of a session that the user already has from
     ///   a previous login call.
-    ///
+    /// - `room_load_settings` — Specify how many rooms must be restored; use
+    ///   `::default()` if you don't know which value to pick.
     /// - `custom_account` - A custom
     ///   [`matrix_sdk_crypto::vodozemac::olm::Account`] to be used for the
     ///   identity and one-time keys of this [`BaseClient`]. If no account is
@@ -395,9 +395,6 @@ impl BaseClient {
     ///   [`UserId`]/[`DeviceId`] combination, an error will be raised. This is
     ///   useful if one wishes to create identity keys before knowing the
     ///   user/device IDs, e.g., to use the identity key as the device ID.
-    ///
-    /// - `room_load_settings` — Specify how many rooms must be restored; use
-    ///   `::default()` if you don't know which value to pick.
     ///
     /// # Panics
     ///
@@ -448,7 +445,8 @@ impl BaseClient {
 
         let olm_machine = builder.build().await.map_err(OlmError::from)?;
 
-        // Subscribe before the machine is shared, so that no room key is missed.
+        // Subscribe before the machine is shared, so that no room key is
+        // missed.
         #[cfg(feature = "unstable-msc4354")]
         let room_keys_stream = olm_machine.store().room_keys_received_stream();
 
@@ -672,7 +670,7 @@ impl BaseClient {
             return Ok(SyncResponse::default());
         }
 
-        let now = if enabled!(Level::INFO) { Some(Instant::now()) } else { None };
+        let _time = timer!(Level::INFO, "Processing a sync response");
 
         // Acquire the state store lock and hold on to it while processing the
         // sync response below.
@@ -708,9 +706,10 @@ impl BaseClient {
                     ProcessedToDeviceEvent, ToDeviceUnableToDecryptInfo,
                     ToDeviceUnableToDecryptReason,
                 };
+                use ruma::events::ToDeviceEventType;
 
-                if let Ok(Some(event_type)) = raw.get_field::<String>("type") {
-                    if event_type == "m.room.encrypted" {
+                if let Ok(Some(event_type)) = raw.get_field::<ToDeviceEventType>("type") {
+                    if event_type == ToDeviceEventType::RoomEncrypted {
                         ProcessedToDeviceEvent::UnableToDecrypt {
                             encrypted_event: raw,
                             utd_info: ToDeviceUnableToDecryptInfo {
@@ -880,10 +879,6 @@ impl BaseClient {
 
         // Release the state store lock
         drop(state_store_guard);
-
-        if enabled!(Level::INFO) {
-            info!("Processed a sync response in {:?}", now.map(|now| now.elapsed()));
-        }
 
         let response = SyncResponse {
             rooms: room_updates,
@@ -1177,7 +1172,7 @@ impl BaseClient {
 
     /// Returns a subscriber that publishes an event every time the ignore user
     /// list changes
-    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<Vec<String>> {
+    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<Vec<OwnedUserId>> {
         self.ignore_user_list_changes.subscribe()
     }
 
@@ -1392,7 +1387,7 @@ mod tests {
     use futures_util::FutureExt as _;
     use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use matrix_sdk_test::{
-        BOB, InvitedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, async_test,
+        InvitedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, User, async_test,
         event_factory::EventFactory, ruma_response_from_json,
     };
     #[cfg(feature = "unstable-msc4426")]
@@ -2058,16 +2053,16 @@ mod tests {
         let f = EventFactory::new();
         let mut sync_builder = SyncResponseBuilder::new();
         let response = sync_builder
-            .add_global_account_data(f.ignored_user_list([(*BOB).into()]))
+            .add_global_account_data(f.ignored_user_list([User::Bob.into()]))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
         assert_let!(Some(ignored) = subscriber.next().await);
-        assert_eq!(ignored, [BOB.to_string()]);
+        assert_eq!(ignored, [User::Bob]);
 
         // Receive the same response.
         let response = sync_builder
-            .add_global_account_data(f.ignored_user_list([(*BOB).into()]))
+            .add_global_account_data(f.ignored_user_list([User::Bob.into()]))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 

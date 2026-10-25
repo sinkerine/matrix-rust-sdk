@@ -140,7 +140,7 @@ use std::{
     ops::Not,
     str::FromStr as _,
     sync::{
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -166,9 +166,12 @@ use matrix_sdk_base::{
 };
 use matrix_sdk_common::{boxed_into_future, locks::Mutex as SyncMutex};
 use mime::Mime;
+#[cfg(feature = "unstable-msc4354")]
+use ruma::events::sticky::StickyDurationMs;
 use ruma::{
     MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedTransactionId, RoomId,
     TransactionId,
+    api::error::ErrorKind,
     events::{
         AnyMessageLikeEventContent, Mentions, MessageLikeEventContent as _, TimelineEventType,
         reaction::ReactionEventContent,
@@ -183,8 +186,10 @@ use ruma::{
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, broadcast, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn};
 
+#[cfg(feature = "unstable-msc4354")]
+use crate::utils::sticky_duration_ms;
 use crate::{
-    Client, Media, Room, TransmissionProgress,
+    Client, Media, Room, SessionChange, TransmissionProgress,
     client::WeakClient,
     config::RequestConfig,
     error::RetryKind,
@@ -241,6 +246,53 @@ impl SendQueue {
         }
     }
 
+    /// Watches for the session getting a working access token again and
+    /// unwedges the requests that were wedged because it didn't have one.
+    async fn session_change_task(client: WeakClient) {
+        let Some(strong_client) = client.get() else { return };
+        let mut session_changes = strong_client.subscribe_to_session_changes();
+        // Don't keep the client alive just by listening.
+        drop(strong_client);
+
+        loop {
+            match session_changes.recv().await {
+                Ok(SessionChange::TokensRefreshed) => {
+                    let Some(client) = client.get() else { break };
+                    client.send_queue().unwedge_requests_with_expired_token().await;
+                }
+
+                Ok(SessionChange::UnknownToken(_)) => {}
+
+                // A missed `TokensRefreshed` would leave requests wedged for good, while
+                // a spurious unwedge only costs a retry that gets wedged again.
+                Err(broadcast::error::RecvError::Lagged(num)) => {
+                    warn!(num, "missed some session changes, unwedging just in case");
+                    let Some(client) = client.get() else { break };
+                    client.send_queue().unwedge_requests_with_expired_token().await;
+                }
+
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
+    /// Unwedge every request that was wedged because the access token had been
+    /// rejected, in every room that has unsent requests.
+    async fn unwedge_requests_with_expired_token(&self) {
+        let room_ids = match self.client.state_store().load_rooms_with_unsent_requests().await {
+            Ok(room_ids) => room_ids,
+            Err(err) => {
+                warn!("error when loading rooms with unsent requests: {err}");
+                return;
+            }
+        };
+
+        for room_id in room_ids {
+            let Some(room) = self.client.get_room(&room_id) else { continue };
+            self.for_room(room).unwedge_requests_with_expired_token().await;
+        }
+    }
+
     /// Tiny helper to get the send queue's global context from the [`Client`].
     #[inline(always)]
     fn data(&self) -> &SendQueueData {
@@ -251,6 +303,14 @@ impl SendQueue {
     /// memoized rooms mapping.
     pub(crate) fn for_room(&self, room: Room) -> RoomSendQueue {
         let data = self.data();
+
+        data.session_change_task.get_or_init(|| {
+            let client = self.client.downgrade();
+            self.client
+                .task_monitor()
+                .spawn_infinite_task("send_queue_session_change", Self::session_change_task(client))
+                .abort_on_drop()
+        });
 
         let mut map = data.rooms.write().unwrap();
 
@@ -413,6 +473,9 @@ pub(super) struct SendQueueData {
 
     /// Will media upload progress be reported via send queue updates?
     report_media_upload_progress: Arc<AtomicBool>,
+
+    /// Task watching for the session getting a working access token again.
+    session_change_task: OnceLock<BackgroundTaskHandle>,
 }
 
 impl SendQueueData {
@@ -428,6 +491,7 @@ impl SendQueueData {
             error_sender,
             is_dropping: Arc::new(false.into()),
             report_media_upload_progress: Arc::new(false.into()),
+            session_change_task: OnceLock::new(),
         }
     }
 }
@@ -480,10 +544,10 @@ impl RoomSendQueue {
     ) -> Self {
         let (update_sender, _) = broadcast::channel(32);
 
-        let queue = QueueStorage::new(WeakClient::from_client(client), room_id.clone());
+        let queue = QueueStorage::new(client.downgrade(), room_id.clone());
         let notifier = Arc::new(Notify::new());
 
-        let weak_room = WeakRoom::new(WeakClient::from_client(client), room_id);
+        let weak_room = WeakRoom::new(client.downgrade(), room_id);
         let locally_enabled = Arc::new(AtomicBool::new(globally_enabled));
 
         let task = client.task_monitor().spawn_infinite_task(
@@ -528,10 +592,24 @@ impl RoomSendQueue {
     /// sending queue will be disabled, and it will need to be manually
     /// re-enabled by the caller (e.g. after network is back, or when something
     /// has been done about the faulty requests).
-    pub async fn send_raw(
+    pub fn send_raw(
         &self,
         content: Raw<AnyMessageLikeEventContent>,
         event_type: String,
+    ) -> SendRawEvent<'_> {
+        SendRawEvent {
+            queue: self,
+            content: SerializableEventContent::from_raw(content, event_type),
+            #[cfg(feature = "unstable-msc4354")]
+            sticky_duration: None,
+        }
+    }
+
+    /// Queues an already serialized event for sending it to this room.
+    async fn send_serialized(
+        &self,
+        content: SerializableEventContent,
+        #[cfg(feature = "unstable-msc4354")] sticky_duration: Option<StickyDurationMs>,
     ) -> Result<SendHandle, RoomSendQueueError> {
         let Some(room) = self.inner.room.get() else {
             return Err(RoomSendQueueError::RoomDisappeared);
@@ -540,10 +618,14 @@ impl RoomSendQueue {
             return Err(RoomSendQueueError::RoomNotJoined);
         }
 
-        let content = SerializableEventContent::from_raw(content, event_type);
+        let request = QueuedRequestKind::Event {
+            content: content.clone(),
+            #[cfg(feature = "unstable-msc4354")]
+            sticky_duration,
+        };
 
         let created_at = MilliSecondsSinceUnixEpoch::now();
-        let transaction_id = self.inner.queue.push(content.clone().into(), created_at).await?;
+        let transaction_id = self.inner.queue.push(request, created_at).await?;
         trace!(%transaction_id, "manager sends a raw event to the background task");
 
         self.inner.notifier.notify_one();
@@ -582,7 +664,13 @@ impl RoomSendQueue {
     /// re-enabled by the caller (e.g. after network is back, or when something
     /// has been done about the faulty requests).
     pub fn send(&self, content: AnyMessageLikeEventContent) -> SendEvent<'_> {
-        SendEvent { queue: self, content, extra_content: None }
+        SendEvent {
+            queue: self,
+            content,
+            extra_content: None,
+            #[cfg(feature = "unstable-msc4354")]
+            sticky_duration: None,
+        }
     }
 
     /// Queues a redaction of another event for sending it to this room.
@@ -603,7 +691,7 @@ impl RoomSendQueue {
         &self,
         redacts: OwnedEventId,
         reason: Option<&str>,
-    ) -> Result<SendRedactionHandle, RoomSendQueueError> {
+    ) -> Result<SendHandle, RoomSendQueueError> {
         let Some(room) = self.inner.room.get() else {
             return Err(RoomSendQueueError::RoomDisappeared);
         };
@@ -622,8 +710,12 @@ impl RoomSendQueue {
 
         self.inner.notifier.notify_one();
 
-        let send_handle =
-            SendRedactionHandle { room: self.clone(), transaction_id: transaction_id.clone() };
+        let send_handle = SendHandle {
+            room: self.clone(),
+            transaction_id: transaction_id.clone(),
+            media_handles: vec![],
+            created_at,
+        };
 
         self.send_update(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
             transaction_id,
@@ -821,7 +913,9 @@ impl RoomSendQueue {
                             // Send Queue will continue as if everything
                             // happened successfully. This feature is not
                             // considered “crucial”.
-                            if let Ok((room_event_cache, _drop_handles)) = room.event_cache().await
+                            if let Some(event_cache) = room.client().event_cache()
+                                && let Ok((room_event_cache, _drop_handles)) =
+                                    event_cache.room(room.room_id()).await
                             {
                                 let timeline_event = match Raw::from_json_string(
                                     // Create a compact string: remove all useless spaces.
@@ -926,7 +1020,9 @@ impl RoomSendQueue {
                             // cache the event now to avoid any inconsistencies
                             // until the server sends down the remote echo via
                             // the sync.
-                            if let Ok((room_event_cache, _drop_handles)) = room.event_cache().await
+                            if let Some(event_cache) = room.client().event_cache()
+                                && let Ok((room_event_cache, _drop_handles)) =
+                                    event_cache.room(room.room_id()).await
                             {
                                 let content_field_redacts = room.version().is_some_and(|id| {
                                     id.rules()
@@ -1005,6 +1101,41 @@ impl RoomSendQueue {
 
                 Ok((None, _)) => {
                     debug!("Request has been aborted while running, continuing.");
+                }
+
+                // The server already has this exact reaction from us (sent from
+                // another device, or by an earlier attempt it no longer
+                // remembers), so there's nothing left to do. Wedging would
+                // block the room for good: every retry gets the same answer.
+                Err(err)
+                    if err.client_api_error_kind() == Some(&ErrorKind::DuplicateAnnotation) =>
+                {
+                    debug!(txn_id = %txn_id, "the server already has this reaction, dropping it");
+
+                    queue.mark_as_not_being_sent(&txn_id).await;
+
+                    match queue.cancel_event(&txn_id, None).await {
+                        Ok(true) => send_update(
+                            &global_update_sender,
+                            &update_sender,
+                            room_id,
+                            RoomSendQueueUpdate::CancelledLocalEvent { transaction_id: txn_id },
+                        ),
+
+                        // Removed meanwhile (aborted before we got here);
+                        // nothing to report.
+                        Ok(false) => {}
+
+                        Err(storage_error) => {
+                            // Still queued, so it would be sent again right
+                            // away, over and over: stop the queue instead.
+                            error!(
+                                txn_id = %txn_id,
+                                "couldn't drop the duplicate reaction, disabling the queue: {storage_error}"
+                            );
+                            locally_enabled.store(false, Ordering::SeqCst);
+                        }
+                    }
                 }
 
                 Err(err) => {
@@ -1099,14 +1230,27 @@ impl RoomSendQueue {
         progress: Option<SharedObservable<TransmissionProgress>>,
     ) -> Result<(Option<SentRequestKey>, Option<EncryptionInfo>), crate::Error> {
         match request.kind {
-            QueuedRequestKind::Event { content } => {
+            QueuedRequestKind::Event {
+                content,
+                #[cfg(feature = "unstable-msc4354")]
+                sticky_duration,
+            } => {
                 let (event, event_type) = content.into_raw();
 
-                let result = room
+                let future = room
                     .send_raw(&event_type, &event)
                     .with_transaction_id(&request.transaction_id)
-                    .with_request_config(RequestConfig::short_retry())
-                    .await?;
+                    .with_request_config(RequestConfig::short_retry());
+
+                #[cfg(feature = "unstable-msc4354")]
+                let future = match sticky_duration {
+                    Some(duration) => {
+                        future.with_sticky_duration(Duration::from_millis(duration.get().into()))
+                    }
+                    None => future,
+                };
+
+                let result = future.await?;
 
                 trace!(txn_id = %request.transaction_id, event_id = %result.response.event_id, "event successfully sent");
 
@@ -1271,6 +1415,24 @@ impl RoomSendQueue {
             .send(SendQueueUpdate { room_id: self.inner.room.room_id().to_owned(), update });
     }
 
+    /// Clear the wedged status of every request that was wedged because the
+    /// access token had been rejected.
+    async fn unwedge_requests_with_expired_token(&self) {
+        let transaction_ids = match self.inner.queue.requests_with_expired_token().await {
+            Ok(transaction_ids) => transaction_ids,
+            Err(err) => {
+                warn!("error when looking for requests wedged by an expired token: {err}");
+                return;
+            }
+        };
+
+        for transaction_id in transaction_ids {
+            if let Err(err) = self.unwedge_request(&transaction_id).await {
+                warn!(%transaction_id, "error when unwedging a request: {err}");
+            }
+        }
+    }
+
     /// Clear a request's wedged status and wake the queue up so it's tried
     /// again.
     async fn unwedge_request(
@@ -1329,6 +1491,10 @@ impl From<&crate::Error> for QueueWedgeError {
 
             // Flatten errors of `Self` type.
             crate::Error::SendQueueWedgeError(error) => *error.clone(),
+
+            crate::Error::Http(error) if error.is_rejected_token() => {
+                QueueWedgeError::ExpiredAccessToken
+            }
 
             _ => QueueWedgeError::GenericApiError { msg: value.to_string() },
         }
@@ -1604,6 +1770,25 @@ impl QueueStorage {
             .await?)
     }
 
+    /// The transaction ids of the requests that were wedged because the
+    /// access token had been rejected.
+    async fn requests_with_expired_token(
+        &self,
+    ) -> Result<Vec<OwnedTransactionId>, RoomSendQueueStorageError> {
+        Ok(self
+            .store
+            .lock()
+            .await
+            .client()?
+            .state_store()
+            .load_send_queue_requests(&self.room_id)
+            .await?
+            .into_iter()
+            .filter(|request| matches!(request.error, Some(QueueWedgeError::ExpiredAccessToken)))
+            .map(|request| request.transaction_id)
+            .collect())
+    }
+
     /// Marks a request pushed with [`Self::push`] and identified with the given
     /// transaction id as sent, by removing it from the local queue.
     async fn mark_as_sent(
@@ -1697,14 +1882,22 @@ impl QueueStorage {
         serializable: SerializableEventContent,
     ) -> Result<bool, RoomSendQueueStorageError> {
         let guard = self.store.lock().await;
+        let client = guard.client()?;
+        let store = client.state_store();
+
+        // Only an event the user composed has content to replace: a redaction
+        // or a reaction has nothing to put the new content into.
+        if !store.load_send_queue_requests(&self.room_id).await?.iter().any(|request| {
+            request.transaction_id == transaction_id && is_own_event_request(request)
+        }) {
+            return Ok(false);
+        }
 
         if guard.being_sent.as_ref().map(|info| info.transaction_id.as_ref())
             == Some(transaction_id)
         {
             // Save the intent to edit the associated event.
-            guard
-                .client()?
-                .state_store()
+            store
                 .save_dependent_queued_request(
                     &self.room_id,
                     transaction_id,
@@ -1717,13 +1910,37 @@ impl QueueStorage {
             return Ok(true);
         }
 
-        let edited = guard
-            .client()?
-            .state_store()
-            .update_send_queue_request(&self.room_id, transaction_id, serializable.into())
-            .await?;
+        let request = QueuedRequestKind::Event {
+            content: serializable,
+            #[cfg(feature = "unstable-msc4354")]
+            sticky_duration: self.sticky_duration_of(store, transaction_id).await?,
+        };
+
+        let edited =
+            store.update_send_queue_request(&self.room_id, transaction_id, request).await?;
 
         Ok(edited)
+    }
+
+    /// The sticky duration of the queued event `transaction_id`, if it is
+    /// queued and sticky.
+    #[cfg(feature = "unstable-msc4354")]
+    async fn sticky_duration_of(
+        &self,
+        store: &DynStateStore,
+        transaction_id: &TransactionId,
+    ) -> Result<Option<StickyDurationMs>, RoomSendQueueStorageError> {
+        let sticky_duration = store
+            .load_send_queue_requests(&self.room_id)
+            .await?
+            .into_iter()
+            .find(|request| request.transaction_id == *transaction_id)
+            .and_then(|request| match request.kind {
+                QueuedRequestKind::Event { sticky_duration, .. } => sticky_duration,
+                _ => None,
+            });
+
+        Ok(sticky_duration)
     }
 
     /// Push requests (and dependents) to upload a media.
@@ -1793,6 +2010,7 @@ impl QueueStorage {
         send_event_txn: OwnedTransactionId,
         created_at: MilliSecondsSinceUnixEpoch,
         item_queue_infos: Vec<GalleryItemQueueInfo>,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<(), RoomSendQueueStorageError> {
         let guard = self.store.lock().await;
         let client = guard.client()?;
@@ -1805,8 +2023,13 @@ impl QueueStorage {
             return Ok(());
         };
 
-        let GalleryItemQueueInfo { content_type, upload_file_txn, file_media_request, thumbnail } =
-            first;
+        let GalleryItemQueueInfo {
+            content_type,
+            upload_file_txn,
+            file_media_request,
+            thumbnail,
+            extra_content: item_extra_content,
+        } = first;
 
         let thumbnail_info = self
             .push_thumbnail_and_media_uploads(
@@ -1820,8 +2043,11 @@ impl QueueStorage {
             )
             .await?;
 
-        finish_item_infos
-            .push(FinishGalleryItemInfo { file_upload: upload_file_txn.clone(), thumbnail_info });
+        finish_item_infos.push(FinishGalleryItemInfo {
+            file_upload: upload_file_txn.clone(),
+            thumbnail_info,
+            extra_content: item_extra_content.clone(),
+        });
         thumbnail_file_sizes.push(thumbnail.as_ref().map(|t| t.file_size));
 
         let mut last_upload_file_txn = upload_file_txn.clone();
@@ -1832,6 +2058,7 @@ impl QueueStorage {
                 upload_file_txn,
                 file_media_request,
                 thumbnail,
+                extra_content: item_extra_content,
             } = item_queue_info;
 
             let thumbnail_info = if let Some(QueueThumbnailInfo {
@@ -1887,6 +2114,7 @@ impl QueueStorage {
             finish_item_infos.push(FinishGalleryItemInfo {
                 file_upload: upload_file_txn.clone(),
                 thumbnail_info: thumbnail_info.cloned(),
+                extra_content: item_extra_content.clone(),
             });
             thumbnail_file_sizes.push(thumbnail.as_ref().map(|t| t.file_size));
 
@@ -1904,6 +2132,7 @@ impl QueueStorage {
                 DependentQueuedRequestKind::FinishGallery {
                     local_echo: Box::new(event),
                     item_infos: finish_item_infos,
+                    extra_content,
                 },
             )
             .await?;
@@ -2010,8 +2239,12 @@ impl QueueStorage {
 
         let requests = store.load_send_queue_requests(&self.room_id).await?;
 
-        // If the target event has been already sent, abort immediately.
-        if !requests.iter().any(|item| item.transaction_id == transaction_id) {
+        // If the target event has been already sent, or isn't something that
+        // can be reacted to in the first place, abort immediately.
+        if !requests
+            .iter()
+            .any(|item| item.transaction_id == transaction_id && is_own_event_request(item))
+        {
             // We didn't find it as a queued request; try to find it as a
             // dependent queued request.
             let dependent_requests = store.load_dependent_queued_requests(&self.room_id).await?;
@@ -2071,7 +2304,7 @@ impl QueueStorage {
             Some(LocalEcho {
                 transaction_id: queued.transaction_id.clone(),
                 content: match queued.kind {
-                    QueuedRequestKind::Event { content } => LocalEchoContent::Event {
+                    QueuedRequestKind::Event { content, .. } => LocalEchoContent::Event {
                         serialized_event: content,
                         send_handle: SendHandle {
                             room: room.clone(),
@@ -2093,9 +2326,11 @@ impl QueueStorage {
                         LocalEchoContent::Redaction {
                             redacts,
                             reason,
-                            send_handle: SendRedactionHandle {
+                            send_handle: SendHandle {
                                 room: room.clone(),
                                 transaction_id: queued.transaction_id,
+                                media_handles: vec![],
+                                created_at: queued.created_at,
                             },
                             send_error: queued.error,
                         }
@@ -2119,9 +2354,11 @@ impl QueueStorage {
                     transaction_id: dep.own_transaction_id.clone().into(),
                     content: LocalEchoContent::React {
                         key,
-                        send_handle: SendReactionHandle {
+                        send_handle: SendHandle {
                             room: room.clone(),
-                            transaction_id: dep.own_transaction_id,
+                            transaction_id: dep.own_transaction_id.into(),
+                            media_handles: vec![],
+                            created_at: dep.created_at,
                         },
                         applies_to: dep.parent_transaction_id,
                     },
@@ -2173,7 +2410,11 @@ impl QueueStorage {
                 }
 
                 #[cfg(feature = "unstable-msc4274")]
-                DependentQueuedRequestKind::FinishGallery { local_echo, item_infos } => {
+                DependentQueuedRequestKind::FinishGallery {
+                    local_echo,
+                    item_infos,
+                    extra_content,
+                } => {
                     // Materialize as an event local echo.
                     self.create_gallery_local_echo(
                         dep.own_transaction_id,
@@ -2181,6 +2422,7 @@ impl QueueStorage {
                         dep.created_at,
                         local_echo,
                         item_infos,
+                        extra_content,
                         &mut media_upload_errors,
                     )
                 }
@@ -2191,6 +2433,7 @@ impl QueueStorage {
 
     /// Create a local echo for a gallery event.
     #[cfg(feature = "unstable-msc4274")]
+    #[allow(clippy::too_many_arguments)]
     fn create_gallery_local_echo(
         &self,
         transaction_id: ChildTransactionId,
@@ -2198,6 +2441,7 @@ impl QueueStorage {
         created_at: MilliSecondsSinceUnixEpoch,
         local_echo: Box<RoomMessageEventContent>,
         item_infos: Vec<FinishGalleryItemInfo>,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
         media_upload_errors: &mut HashMap<OwnedTransactionId, QueueWedgeError>,
     ) -> Option<LocalEcho> {
         // If any of the uploads wedged, the gallery event is wedged too.
@@ -2210,7 +2454,12 @@ impl QueueStorage {
         Some(LocalEcho {
             transaction_id: transaction_id.clone().into(),
             content: LocalEchoContent::Event {
-                serialized_event: SerializableEventContent::new(&(*local_echo).into()).ok()?,
+                serialized_event: upload::merge_gallery_extra_content(
+                    SerializableEventContent::new(&(*local_echo).into()).ok()?,
+                    extra_content,
+                    item_infos.iter().map(|item| item.extra_content.clone()),
+                )
+                .ok()?,
                 send_handle: SendHandle {
                     room: room.clone(),
                     transaction_id: transaction_id.into(),
@@ -2263,9 +2512,15 @@ impl QueueStorage {
                     // Check the event is one we know how to edit with an edit
                     // event.
 
+                    // Fields the typed content doesn't know about, like an
+                    // attachment's extra content, to put back in the edit.
+                    let mut unknown_fields = None;
+
                     // It must be deserializable…
                     let edited_content = match new_content.deserialize() {
                         Ok(AnyMessageLikeEventContent::RoomMessage(c)) => {
+                            unknown_fields = upload::unknown_fields(&new_content, &c);
+
                             // Assume no relationships.
                             EditedContent::RoomMessage(c.into())
                         }
@@ -2297,10 +2552,26 @@ impl QueueStorage {
                         }
                     };
 
+                    let mut edit_json = serde_json::to_value(&edit_event)
+                        .map_err(RoomSendQueueStorageError::JsonSerialization)?;
+
+                    // Only in the new content: the top level is what push rules
+                    // see, and an edit mustn't notify again.
+                    if let Some(serde_json::Value::Object(mut unknown)) = unknown_fields
+                        && let Some(edited) = edit_json.get_mut("m.new_content")
+                    {
+                        // The edit has its own relation and new content.
+                        unknown.remove("m.relates_to");
+                        unknown.remove("m.new_content");
+                        upload::restore_unknown_fields(edited, unknown.into());
+                    }
+
                     // Queue the edit event in the send queue 🧠.
                     let serializable = SerializableEventContent::from_raw(
-                        Raw::new(&edit_event)
-                            .map_err(RoomSendQueueStorageError::JsonSerialization)?,
+                        Raw::from_json(
+                            serde_json::value::to_raw_value(&edit_json)
+                                .map_err(RoomSendQueueStorageError::JsonSerialization)?,
+                        ),
                         edit_event.event_type().to_string(),
                     );
 
@@ -2316,12 +2587,18 @@ impl QueueStorage {
                         .map_err(RoomSendQueueStorageError::StateStoreError)?;
                 } else {
                     // The parent event is still local; update the local echo.
+                    let parent_transaction_id = &dependent_request.parent_transaction_id;
+
+                    let request = QueuedRequestKind::Event {
+                        content: new_content,
+                        #[cfg(feature = "unstable-msc4354")]
+                        sticky_duration: self
+                            .sticky_duration_of(store, parent_transaction_id)
+                            .await?,
+                    };
+
                     let edited = store
-                        .update_send_queue_request(
-                            &self.room_id,
-                            &dependent_request.parent_transaction_id,
-                            new_content.into(),
-                        )
+                        .update_send_queue_request(&self.room_id, parent_transaction_id, request)
                         .await
                         .map_err(RoomSendQueueStorageError::StateStoreError)?;
 
@@ -2463,7 +2740,7 @@ impl QueueStorage {
             }
 
             #[cfg(feature = "unstable-msc4274")]
-            DependentQueuedRequestKind::FinishGallery { local_echo, item_infos } => {
+            DependentQueuedRequestKind::FinishGallery { local_echo, item_infos, extra_content } => {
                 let Some(parent_key) = parent_key else {
                     // Not finished yet, we should retry later => false.
                     return Ok(false);
@@ -2474,6 +2751,7 @@ impl QueueStorage {
                     parent_key,
                     *local_echo,
                     item_infos,
+                    extra_content,
                     new_updates,
                 )
                 .await?;
@@ -2580,6 +2858,7 @@ struct GalleryItemQueueInfo {
     upload_file_txn: OwnedTransactionId,
     file_media_request: MediaRequestParameters,
     thumbnail: Option<QueueThumbnailInfo>,
+    extra_content: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// The content of a local echo.
@@ -2602,7 +2881,7 @@ pub enum LocalEchoContent {
         /// The key with which the local echo has been reacted to.
         key: String,
         /// A handle to manipulate the sending of the reaction.
-        send_handle: SendReactionHandle,
+        send_handle: SendHandle,
         /// The local echo which has been reacted to.
         applies_to: OwnedTransactionId,
     },
@@ -2614,7 +2893,7 @@ pub enum LocalEchoContent {
         /// The reason for the event being redacted.
         reason: Option<String>,
         /// A handle to manipulate the sending of the associated event.
-        send_handle: SendRedactionHandle,
+        send_handle: SendHandle,
         /// Whether trying to send this local echo failed in the past with an
         /// unrecoverable error (see [`SendQueueRoomError::is_recoverable`]).
         send_error: Option<QueueWedgeError>,
@@ -2746,6 +3025,11 @@ pub enum RoomSendQueueError {
     #[error("the attachment event could not be created")]
     FailedToCreateAttachment,
 
+    /// The target of an [`RoomSendQueue::edit_with_attachment`] can't be
+    /// edited with a new attachment.
+    #[error(transparent)]
+    Edit(#[from] crate::room::edit::EditError),
+
     /// The gallery contains no items.
     #[cfg(feature = "unstable-msc4274")]
     #[error("the gallery contains no items")]
@@ -2816,6 +3100,8 @@ pub struct SendEvent<'a> {
     queue: &'a RoomSendQueue,
     content: AnyMessageLikeEventContent,
     extra_content: Option<serde_json::Map<String, serde_json::Value>>,
+    #[cfg(feature = "unstable-msc4354")]
+    sticky_duration: Option<StickyDurationMs>,
 }
 
 impl<'a> SendEvent<'a> {
@@ -2827,6 +3113,17 @@ impl<'a> SendEvent<'a> {
         extra_content: serde_json::Map<String, serde_json::Value>,
     ) -> Self {
         self.extra_content = Some(extra_content);
+        self
+    }
+
+    /// Send the event as a sticky event for `duration`, clamped to one hour.
+    ///
+    /// Note that if the homeserver doesn't support sticky events, it will
+    /// ignore the duration and send the event unsticky. Server support can
+    /// be checked with [`Client::supports_sticky_events`].
+    #[cfg(feature = "unstable-msc4354")]
+    pub fn with_sticky_duration(mut self, duration: Duration) -> Self {
+        self.sticky_duration = Some(sticky_duration_ms(duration));
         self
     }
 }
@@ -2842,13 +3139,61 @@ impl<'a> IntoFuture for SendEvent<'a> {
                     .map_err(RoomSendQueueStorageError::JsonSerialization)?,
                 self.extra_content,
             )?;
-            let (raw, event_type) = serialized.into_raw();
-            self.queue.send_raw(raw, event_type).await
+            self.queue
+                .send_serialized(
+                    serialized,
+                    #[cfg(feature = "unstable-msc4354")]
+                    self.sticky_duration,
+                )
+                .await
+        })
+    }
+}
+
+/// Future returned by [`RoomSendQueue::send_raw`].
+#[allow(missing_debug_implementations)]
+pub struct SendRawEvent<'a> {
+    queue: &'a RoomSendQueue,
+    content: SerializableEventContent,
+    #[cfg(feature = "unstable-msc4354")]
+    sticky_duration: Option<StickyDurationMs>,
+}
+
+impl SendRawEvent<'_> {
+    /// Send the event as a sticky event for `duration`, clamped to one hour.
+    ///
+    /// Note that if the homeserver doesn't support sticky events, it will
+    /// ignore the duration and send the event unsticky. Server support can
+    /// be checked with [`Client::supports_sticky_events`].
+    #[cfg(feature = "unstable-msc4354")]
+    pub fn with_sticky_duration(mut self, duration: Duration) -> Self {
+        self.sticky_duration = Some(sticky_duration_ms(duration));
+        self
+    }
+}
+
+impl<'a> IntoFuture for SendRawEvent<'a> {
+    type Output = Result<SendHandle, RoomSendQueueError>;
+    boxed_into_future!(extra_bounds: 'a);
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            self.queue
+                .send_serialized(
+                    self.content,
+                    #[cfg(feature = "unstable-msc4354")]
+                    self.sticky_duration,
+                )
+                .await
         })
     }
 }
 
 /// A handle to manipulate an event that was scheduled to be sent to a room.
+///
+/// The event may be a room message, a media upload, a redaction or a reaction;
+/// [`Self::edit`] and [`Self::react`] only apply to the first two, and return
+/// `false`/`None` for the others.
 #[derive(Clone, Debug)]
 pub struct SendHandle {
     /// Link to the send queue used to send this request.
@@ -2937,7 +3282,14 @@ impl SendHandle {
             // below, that handles aborting sending of an event.
         }
 
-        if queue.cancel_event(&self.transaction_id, reason).await? {
+        // A reaction is queued as a dependent request of the event it applies
+        // to, so it has no entry in the main queue as long as that
+        // event hasn't been sent.
+        let aborted =
+            queue.remove_dependent_send_queue_request(&self.transaction_id.clone().into()).await?
+                || queue.cancel_event(&self.transaction_id, reason).await?;
+
+        if aborted {
             trace!("successful abort");
 
             // Wake up the queue, in case it was blocked on this request being
@@ -2960,6 +3312,14 @@ impl SendHandle {
     ///
     /// Returns true if the event to be sent was replaced, false if not (i.e.
     /// the event had already been sent).
+    ///
+    /// This method should not be used for editing sticky events. Sticky events
+    /// are collected in an ephemeral map. Entries in that map need to be
+    /// updated by sending a replacing sticky event with updated content,
+    /// not by using an `m.replace` relation. Nevertheless, this method
+    /// applies edits of an _unsent_ sticky event on the queued event
+    /// directly because it is safe to do so. If, however, the event has
+    /// already been sent, the edit will be sent as an unsticky event.
     #[instrument(skip(self, new_content), fields(room_id = %self.room.inner.room.room_id(), txn_id = %self.transaction_id))]
     pub async fn edit_raw(
         &self,
@@ -2994,6 +3354,14 @@ impl SendHandle {
     ///
     /// Returns true if the event to be sent was replaced, false if not (i.e.
     /// the event had already been sent).
+    ///
+    /// This method should not be used for editing sticky events. Sticky events
+    /// are collected in an ephemeral map. Entries in that map need to be
+    /// updated by sending a replacing sticky event with updated content,
+    /// not by using an `m.replace` relation. Nevertheless, this method
+    /// applies edits of an _unsent_ sticky event on the queued event
+    /// directly because it is safe to do so. If, however, the event has
+    /// already been sent, the edit will be sent as an unsticky event.
     pub async fn edit(
         &self,
         new_content: AnyMessageLikeEventContent,
@@ -3026,9 +3394,6 @@ impl SendHandle {
 
             // Wake up the queue, in case the room was asleep before the edit.
             self.room.inner.notifier.notify_one();
-
-            let new_content = SerializableEventContent::new(&new_content)
-                .map_err(RoomSendQueueStorageError::JsonSerialization)?;
 
             // Propagate a replaced update too.
             self.room.send_update(RoomSendQueueUpdate::ReplacedLocalEvent {
@@ -3077,7 +3442,7 @@ impl SendHandle {
     pub async fn react(
         &self,
         key: String,
-    ) -> Result<Option<SendReactionHandle>, RoomSendQueueStorageError> {
+    ) -> Result<Option<SendHandle>, RoomSendQueueStorageError> {
         trace!("received an intent to react");
 
         let created_at = MilliSecondsSinceUnixEpoch::now();
@@ -3091,9 +3456,11 @@ impl SendHandle {
             self.room.inner.notifier.notify_one();
 
             // Propagate a new local event.
-            let send_handle = SendReactionHandle {
+            let send_handle = SendHandle {
                 room: self.room.clone(),
-                transaction_id: reaction_txn_id.clone(),
+                transaction_id: reaction_txn_id.clone().into(),
+                media_handles: vec![],
+                created_at,
             };
 
             self.room.send_update(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
@@ -3115,114 +3482,17 @@ impl SendHandle {
     }
 }
 
-/// A handle to execute actions on the sending of a reaction.
-#[derive(Clone, Debug)]
-pub struct SendReactionHandle {
-    /// Reference to the send queue for the room where this reaction was sent.
-    room: RoomSendQueue,
-    /// The own transaction id for the reaction.
-    transaction_id: ChildTransactionId,
-}
-
-impl SendReactionHandle {
-    /// Creates a new [`SendReactionHandle`].
-    #[cfg(test)]
-    pub(crate) fn new(room: RoomSendQueue, transaction_id: ChildTransactionId) -> Self {
-        Self { room, transaction_id }
-    }
-
-    /// Abort the sending of the reaction.
-    ///
-    /// Will return true if the reaction could be aborted, false if it's been
-    /// sent (and there's no matching local echo anymore).
-    pub async fn abort(&self) -> Result<bool, RoomSendQueueStorageError> {
-        if self.room.inner.queue.remove_dependent_send_queue_request(&self.transaction_id).await? {
-            // Simple case: the reaction was found in the dependent event list.
-
-            // Propagate a cancelled update too.
-            self.room.send_update(RoomSendQueueUpdate::CancelledLocalEvent {
-                transaction_id: self.transaction_id.clone().into(),
-            });
-
-            return Ok(true);
-        }
-
-        // The reaction has already been queued for sending, try to abort it
-        // using a regular abort.
-        let handle = SendHandle {
-            room: self.room.clone(),
-            transaction_id: self.transaction_id.clone().into(),
-            media_handles: vec![],
-            created_at: MilliSecondsSinceUnixEpoch::now(),
-        };
-
-        handle.abort().await
-    }
-
-    /// Unwedge the reaction and try to send it again.
-    ///
-    /// A reaction still waiting on its parent to be sent can't be wedged;
-    /// unwedging it only wakes the queue.
-    pub async fn unwedge(&self) -> Result<(), RoomSendQueueError> {
-        self.room.unwedge_request(&self.transaction_id).await
-    }
-
-    /// The transaction id that will be used to send this reaction later.
-    pub fn transaction_id(&self) -> &TransactionId {
-        &self.transaction_id
-    }
-}
-
-/// A handle to manipulate a redaction event that was scheduled to be sent to a
-/// room.
-#[derive(Clone, Debug)]
-pub struct SendRedactionHandle {
-    /// Link to the send queue used to send this request.
-    room: RoomSendQueue,
-
-    /// Transaction id used for the sent request.
-    transaction_id: OwnedTransactionId,
-}
-
-impl SendRedactionHandle {
-    /// Creates a new [`SendRedactionHandle`].
-    #[cfg(test)]
-    pub(crate) fn new(room: RoomSendQueue, transaction_id: OwnedTransactionId) -> Self {
-        Self { room, transaction_id }
-    }
-
-    /// Abort the sending of the redaction.
-    ///
-    /// Will return true if the redaction could be aborted, false if it's been
-    /// sent (and there's no matching local echo anymore).
-    pub async fn abort(&self) -> Result<bool, RoomSendQueueStorageError> {
-        trace!("received a redaction abort request");
-
-        let queue = &self.room.inner.queue;
-
-        if queue.cancel_event(&self.transaction_id, None).await? {
-            trace!("successful redaction abort");
-
-            // Wake up the queue, in case it was blocked on this request being
-            // wedged.
-            self.room.inner.notifier.notify_one();
-
-            // Propagate a cancelled update too.
-            self.room.send_update(RoomSendQueueUpdate::CancelledLocalEvent {
-                transaction_id: self.transaction_id.clone(),
-            });
-
-            Ok(true)
-        } else {
-            debug!("local echo of redaction didn't exist anymore, can't abort");
-            Ok(false)
-        }
-    }
-
-    /// Unwedge the redaction and try to send it again.
-    pub async fn unwedge(&self) -> Result<(), RoomSendQueueError> {
-        self.room.unwedge_request(&self.transaction_id).await
-    }
+/// Whether a queued request is an event the user composed, as opposed to a
+/// redaction or a reaction.
+///
+/// A reaction is queued as a dependent request at first, but graduates into a
+/// request of its own, under the same transaction id, once the event it
+/// applies to has been sent; so being an event is not enough to tell the two
+/// apart.
+fn is_own_event_request(request: &QueuedRequest) -> bool {
+    request.as_event().is_some_and(|content| {
+        TimelineEventType::from(content.raw().1) != TimelineEventType::Reaction
+    })
 }
 
 /// From a given source of [`DependentQueuedRequest`], return only the most
@@ -3297,13 +3567,18 @@ mod tests {
     use matrix_sdk_test::{JoinedRoomBuilder, SyncResponseBuilder, async_test};
     use ruma::{
         MilliSecondsSinceUnixEpoch, TransactionId,
+        api::error::UnknownTokenErrorData,
+        event_id,
         events::{AnyMessageLikeEventContent, room::message::RoomMessageEventContent},
         room_id,
     };
     use strass::assert_let;
 
-    use super::canonicalize_dependent_requests;
-    use crate::{client::WeakClient, test_utils::logged_in_client};
+    use super::{RoomSendQueueUpdate, canonicalize_dependent_requests};
+    use crate::{
+        SessionChange,
+        test_utils::{logged_in_client, mocks::MatrixMockServer},
+    };
 
     #[test]
     fn test_canonicalize_dependent_events_created_at() {
@@ -3341,7 +3616,7 @@ mod tests {
     async fn test_client_no_cycle_with_send_queue() {
         for enabled in [true, false] {
             let client = logged_in_client(None).await;
-            let weak_client = WeakClient::from_client(&client);
+            let weak_client = client.downgrade();
 
             {
                 let mut sync_response_builder = SyncResponseBuilder::new();
@@ -3572,5 +3847,36 @@ mod tests {
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].own_transaction_id, edit_id);
         assert_eq!(res[1].own_transaction_id, react_id);
+    }
+
+    #[async_test]
+    async fn test_request_wedged_by_a_rejected_token_is_unwedged_on_lag() {
+        let mock = MatrixMockServer::new().await;
+        let client = mock.client_builder().build().await;
+        let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+
+        let q = room.send_queue();
+        let (_, mut watch) = q.subscribe().await.unwrap();
+
+        mock.mock_room_state_encryption().plain().mount().await;
+        mock.mock_room_send().error_unknown_token(false).mock_once().mount().await;
+        mock.mock_room_send().ok(event_id!("$42")).mock_once().mount().await;
+
+        q.send(RoomMessageEventContent::text_plain("hello").into()).await.unwrap();
+
+        assert_let!(Ok(RoomSendQueueUpdate::NewLocalEvent(_)) = watch.recv().await);
+        assert_let!(
+            Ok(RoomSendQueueUpdate::SendError { is_recoverable: false, .. }) = watch.recv().await
+        );
+
+        // The token gets refreshed, then rejected again before the send queue
+        // gets to see the refresh, so all it sees is a lag.
+        let sender = &client.auth_ctx().session_change_sender;
+        sender.send(SessionChange::TokensRefreshed).unwrap();
+        sender.send(SessionChange::UnknownToken(UnknownTokenErrorData::new())).unwrap();
+
+        // Which is still enough for the request to be retried.
+        assert_let!(Ok(RoomSendQueueUpdate::RetryEvent { .. }) = watch.recv().await);
+        assert_let!(Ok(RoomSendQueueUpdate::SentEvent { .. }) = watch.recv().await);
     }
 }

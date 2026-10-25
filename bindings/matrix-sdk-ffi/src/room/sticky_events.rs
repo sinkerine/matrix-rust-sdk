@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use matrix_sdk_base::sticky::{
     RemovalReason, StickyEvent as SdkStickyEvent, StickyEventsUpdate as SdkStickyEventsUpdate,
@@ -21,8 +21,10 @@ use matrix_sdk_base::sticky::{
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use tokio::sync::broadcast::error::RecvError;
 
-use super::Room;
-use crate::{TaskHandle, encryption::EventEncryptionInfo, runtime::get_runtime_handle};
+use super::{RequestConfigOverride, Room};
+use crate::{
+    TaskHandle, encryption::EventEncryptionInfo, error::ClientError, runtime::get_runtime_handle,
+};
 
 /// The key under which a sticky event is tracked in a room.
 ///
@@ -169,5 +171,50 @@ impl Room {
                 }
             }
         })))
+    }
+
+    /// Send a sticky event to this room.
+    //
+    /// Note that if the homeserver doesn't support sticky events, it will
+    /// ignore the duration and send the event unsticky. Server support can
+    /// be checked with [`Client::is_sticky_events_supported`].
+    ///
+    /// # Arguments
+    ///
+    /// - `event_type` - The type of the event to send.
+    /// - `content` - The content of the event to send encoded as JSON string.
+    /// - `duration_ms` - How long the event stays sticky for, in milliseconds,
+    ///   clamped to one hour.
+    /// - `request_config_override` - Overrides the client's request config for
+    ///   this request. Fields that are not set keep the client's values.
+    ///
+    /// # Returns
+    ///
+    /// The event ID of the newly sent event.
+    ///
+    /// [`Client::is_sticky_events_supported`]: crate::client::Client::is_sticky_events_supported
+    #[uniffi::method(default(request_config_override = None))]
+    pub async fn send_sticky_raw(
+        &self,
+        event_type: String,
+        content: String,
+        duration_ms: u64,
+        request_config_override: Option<RequestConfigOverride>,
+    ) -> Result<String, ClientError> {
+        let content_json: serde_json::Value =
+            serde_json::from_str(&content).map_err(matrix_sdk::Error::SerdeJson)?;
+
+        let mut request = self
+            .inner
+            .send_raw(&event_type, content_json)
+            .with_sticky_duration(Duration::from_millis(duration_ms));
+        if let Some(request_config_override) = request_config_override {
+            request = request.with_request_config(
+                request_config_override.apply_to(self.inner.client().request_config()),
+            );
+        }
+        let response = request.await?;
+
+        Ok(response.response.event_id.to_string())
     }
 }

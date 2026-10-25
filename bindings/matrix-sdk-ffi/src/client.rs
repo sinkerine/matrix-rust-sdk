@@ -16,12 +16,12 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
     path::PathBuf,
+    pin::pin,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use anyhow::{Context as _, anyhow};
-use futures_util::pin_mut;
 #[cfg(feature = "sqlite")]
 use matrix_sdk::STATE_STORE_DATABASE_NAME;
 #[cfg(not(target_family = "wasm"))]
@@ -89,8 +89,8 @@ use ruma::{
             },
             profile::{AvatarUrl, Call, DisplayName, ProfileFieldName, StaticProfileField, Status},
             room::create_room::{RoomPowerLevelsContentOverride, v3::CreationContent},
-            rtc::RtcTransport,
-            uiaa::{EmailUserIdentifier, UserIdentifier},
+            rtc::RtcTransport as RumaRtcTransport,
+            uiaa::{self, EmailUserIdentifier, Password, UserIdentifier},
         },
         error::ErrorKind,
     },
@@ -151,8 +151,8 @@ use crate::{
     room_directory_search::RoomDirectorySearch,
     room_preview::RoomPreview,
     ruma::{
-        AccountDataEvent, AccountDataEventType, AuthData, InviteAvatars, MediaPreviewConfig,
-        MediaPreviews, MediaSource, PresenceState, RoomAccountDataEvent, UserCall, UserStatus,
+        AccountDataEvent, AccountDataEventType, InviteAvatars, MediaPreviewConfig, MediaPreviews,
+        MediaSource, PresenceState, RoomAccountDataEvent, UserCall, UserStatus,
     },
     runtime::get_runtime_handle,
     spaces::SpaceService,
@@ -948,7 +948,7 @@ impl Client {
         let stream = self.inner.observe_own_beacon_info_updates()?;
 
         Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(stream);
+            let mut stream = pin!(stream);
 
             while let Some(update) = stream.next().await {
                 listener.on_update(update.into());
@@ -1443,7 +1443,7 @@ impl Client {
         let stream = self.inner.subscribe_to_own_profile()?;
 
         Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(stream);
+            let mut stream = pin!(stream);
 
             while let Some(profile) = stream.next().await {
                 match UserProfile::from_profile(&user_id, &profile) {
@@ -1878,6 +1878,19 @@ impl Client {
         Arc::new(Encryption { inner: self.inner.encryption(), _client: self.clone() })
     }
 
+    /// Whether the user has joined at least one encrypted room, spaces
+    /// excluded.
+    ///
+    /// The local cache is consulted first, falling back to asking the
+    /// homeserver directly if no encrypted room is known. If the server
+    /// does not answer in `timeout_ms` milliseconds, this returns an error.
+    ///
+    /// Clients should treat errors as "maybe encrypted", not as "not
+    /// encrypted".
+    pub async fn has_encrypted_rooms(&self, timeout: Duration) -> Result<bool, ClientError> {
+        Ok(self.inner.has_encrypted_rooms(timeout).await?)
+    }
+
     // Ignored users
 
     pub async fn ignored_users(&self) -> Result<Vec<String>, ClientError> {
@@ -1912,10 +1925,12 @@ impl Client {
     ) -> Arc<TaskHandle> {
         let mut subscriber = self.inner.subscribe_to_ignore_user_list_changes();
 
-        listener.call(subscriber.next_now());
+        let user_ids = subscriber.next_now().into_iter().map(Into::into).collect();
+        listener.call(user_ids);
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             while let Some(user_ids) = subscriber.next().await {
+                let user_ids = user_ids.into_iter().map(Into::into).collect();
                 listener.call(user_ids);
             }
         })))
@@ -2080,22 +2095,29 @@ impl Client {
     /// `encryption::reset_identity` this will only work with password-based
     /// authentication (`m.login.password`)
     ///
-    /// # Arguments
-    ///
-    /// - `auth_data` - This request uses the [User-Interactive Authentication
-    ///   API][uiaa]. The first request needs to set this to `None` and will
-    ///   always fail and the same request needs to be made but this time with
-    ///   some `auth_data` provided.
+    /// This sends the initial unauthenticated request to retrieve a User-
+    /// Interactive Authentication session, then completes it with the given
+    /// password.
     pub async fn deactivate_account(
         &self,
-        auth_data: Option<AuthData>,
+        password: String,
         erase_data: bool,
     ) -> Result<(), ClientError> {
-        if let Some(auth_data) = auth_data {
-            _ = self.inner.account().deactivate(None, Some(auth_data.into()), erase_data).await?;
-        } else {
-            _ = self.inner.account().deactivate(None, None, erase_data).await?;
-        }
+        let account = self.inner.account();
+
+        let Err(error) = account.deactivate(None, None, erase_data).await else {
+            return Ok(());
+        };
+
+        let Some(session) = error.as_uiaa_response().and_then(|info| info.session.clone()) else {
+            return Err(error.into());
+        };
+
+        let user_id = self.inner.user_id().context("No user ID found")?;
+        let mut password = Password::new(user_id.to_owned().into(), password);
+        password.session = Some(session);
+
+        account.deactivate(None, Some(uiaa::AuthData::Password(password)), erase_data).await?;
 
         Ok(())
     }
@@ -2180,7 +2202,9 @@ impl Client {
             // `EventCacheStore::clear_all_events` here, because there might be
             // live observers of the linked chunks, and that would cause some
             // very bad state mismatch.
-            self.inner.event_cache().clear_all_rooms().await?;
+            if let Some(event_cache) = self.inner.event_cache() {
+                event_cache.clear_all_rooms().await?;
+            }
 
             // Delete the state store file, if it exists.
             #[cfg(feature = "sqlite")]
@@ -2221,7 +2245,10 @@ impl Client {
 
     /// Checks if the server supports the report room API.
     pub async fn is_report_room_api_supported(&self) -> Result<bool, ClientError> {
-        Ok(self.inner.server_versions().await?.contains(&ruma::api::MatrixVersion::V1_13))
+        use ruma::api::{Metadata, client::room::report_room};
+
+        let supported_versions = self.inner.supported_versions().await?;
+        Ok(report_room::v3::Request::PATH_BUILDER.is_supported(&supported_versions))
     }
 
     /// Checks if the server supports the LiveKit RTC focus for placing calls.
@@ -2234,7 +2261,27 @@ impl Client {
     /// [`Client::disable_well_known_lookup`].
     pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
         let transports = self.inner.discover_rtc_transports().await?.unwrap_or_default();
-        Ok(transports.iter().any(|focus| matches!(focus, RtcTransport::LiveKit { .. })))
+        Ok(transports.iter().any(|focus| matches!(focus, RumaRtcTransport::LiveKit { .. })))
+    }
+
+    /// Discover the RTC transports advertised by the homeserver.
+    ///
+    /// The transports are first looked up through the authenticated
+    /// `GET /_matrix/client/v1/rtc/transports` endpoint (MSC4143). If the
+    /// homeserver doesn't implement that endpoint, this falls back to the
+    /// `m.rtc_foci` field of the well-known, unless well-known discovery was
+    /// disabled with [`ClientBuilder::disable_well_known_lookup`] or
+    /// [`Client::disable_well_known_lookup`].
+    ///
+    /// Returns `None` if neither source could provide transports, which is kept
+    /// distinct from an empty list, i.e. a homeserver that advertises no
+    /// transports at all.
+    pub async fn discover_rtc_transports(&self) -> Result<Option<Vec<RtcTransport>>, ClientError> {
+        Ok(self
+            .inner
+            .discover_rtc_transports()
+            .await?
+            .map(|transports| transports.iter().map(Into::into).collect()))
     }
 
     /// Checks if the server supports the Profiles sliding sync extension.
@@ -2293,7 +2340,7 @@ impl Client {
 
         Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             // Listen for changes and notify the listener.
-            pin_mut!(stream);
+            let mut stream = pin!(stream);
             while let Some(media_preview_config) = stream.next().await {
                 listener.on_change(Some(media_preview_config.into()));
             }
@@ -2405,13 +2452,16 @@ impl Client {
     /// front-loaded by recency (the last week for all rooms first, then the
     /// previous week, and so on), to populate the search index.
     ///
-    /// Requires `ClientBuilder::enable_automatic_back_pagination` to have been
-    /// enabled, otherwise this no-ops.
+    /// Requires `ClientBuilder::enable_automatic_back_pagination` and
+    /// `ClientBuilder::enable_event_cache` to have been enabled, otherwise
+    /// this no-ops.
     pub fn run_search_backfill(&self, strategy: SearchBackfillStrategy) -> Arc<TaskHandle> {
         let client = self.inner.clone();
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            client.event_cache().run_search_backfill(strategy).await;
+            if let Some(event_cache) = client.event_cache() {
+                event_cache.run_search_backfill(strategy).await;
+            }
         })))
     }
 
@@ -2518,7 +2568,7 @@ impl Client {
         let messages = self.inner.subscribe_to_custom_to_device_messages(event_types);
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(messages);
+            let mut messages = pin!(messages);
 
             while let Some(message) = messages.next().await {
                 match ToDeviceMessage::try_from(message) {
@@ -2527,6 +2577,18 @@ impl Client {
                 }
             }
         })))
+    }
+}
+
+#[cfg(feature = "unstable-msc4354")]
+#[matrix_sdk_ffi_macros::export]
+impl Client {
+    /// Checks if the server supports sticky events.
+    ///
+    /// This is async and fallible as it may use the network to retrieve the
+    /// server supported features, if they aren't cached already.
+    pub async fn is_sticky_events_supported(&self) -> Result<bool, ClientError> {
+        Ok(self.inner.supports_sticky_events().await?)
     }
 }
 
@@ -3633,6 +3695,42 @@ impl TryFrom<RumaAllowRule> for AllowRule {
     }
 }
 
+/// Information about a MatrixRTC transport advertised by the homeserver.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum RtcTransport {
+    /// A LiveKit RTC transport.
+    LiveKit {
+        /// The URL of the LiveKit service.
+        service_url: String,
+    },
+
+    /// A transport type the SDK doesn't know about, up for interpretation by
+    /// the consumer.
+    Custom {
+        /// The value of the `type` field of the transport.
+        transport_type: String,
+
+        /// The remaining transport data, as a serialized JSON object. It
+        /// doesn't contain the `type` field.
+        data: String,
+    },
+}
+
+impl From<&RumaRtcTransport> for RtcTransport {
+    fn from(value: &RumaRtcTransport) -> Self {
+        match value {
+            RumaRtcTransport::LiveKit(info) => {
+                Self::LiveKit { service_url: info.service_url.clone() }
+            }
+            _ => Self::Custom {
+                transport_type: value.transport_type().to_owned(),
+                // A `JsonObject` always serializes successfully.
+                data: serde_json::to_string(&value.data()).unwrap_or_else(|_| "{}".to_owned()),
+            },
+        }
+    }
+}
+
 /// Contains the disk size of the different stores, if known. It won't be
 /// available for in-memory stores.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3645,6 +3743,8 @@ pub struct StoreSizes {
     event_cache_store: Option<u64>,
     /// The size of the MediaStore.
     media_store: Option<u64>,
+    /// The size of the search index.
+    search_index: Option<u64>,
 }
 
 impl From<matrix_sdk::StoreSizes> for StoreSizes {
@@ -3654,6 +3754,7 @@ impl From<matrix_sdk::StoreSizes> for StoreSizes {
             state_store: value.state_store.map(|v| v as u64),
             event_cache_store: value.event_cache_store.map(|v| v as u64),
             media_store: value.media_store.map(|v| v as u64),
+            search_index: value.search_index.map(|v| v as u64),
         }
     }
 }
@@ -3916,5 +4017,26 @@ mod tests {
         assert!(converted.avatar_url.is_none());
         assert!(converted.status.is_none());
         assert!(converted.call.is_none());
+    }
+
+    #[test]
+    fn test_rtc_transport_conversion() {
+        use ruma::api::client::rtc::RtcTransport as RumaRtcTransport;
+        use strass::assert_let;
+
+        use super::RtcTransport;
+
+        let livekit = RumaRtcTransport::livekit("https://livekit.example.com".to_owned());
+        assert_let!(RtcTransport::LiveKit { service_url } = RtcTransport::from(&livekit));
+        assert_eq!(service_url, "https://livekit.example.com");
+
+        let custom = RumaRtcTransport::new(
+            "com.example.custom",
+            serde_json::json!({ "endpoint": "https://example.com" }).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        assert_let!(RtcTransport::Custom { transport_type, data } = RtcTransport::from(&custom));
+        assert_eq!(transport_type, "com.example.custom");
+        assert_eq!(data, r#"{"endpoint":"https://example.com"}"#);
     }
 }

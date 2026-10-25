@@ -115,11 +115,17 @@ impl Caches {
         let own_user_id =
             client.user_id().expect("the user must be logged in, at this point").to_owned();
 
+        // Computed while building the state: nothing may await once the state
+        // is inserted, or a cancellation or error would leave it
+        // inserted without its `Caches`, making every later attempt
+        // fail.
+        let mut timeline_is_not_empty = false;
+
         let room_state = state
             .try_insert_once_with(
                 states::selectors::RoomStateSelector::new(room_id.to_owned()),
-                |store_guard| {
-                    room::RoomEventCacheState::new(
+                async |store_guard| {
+                    let room_state = room::RoomEventCacheState::new(
                         own_user_id.clone(),
                         room_id.to_owned(),
                         weak_room.clone(),
@@ -131,12 +137,15 @@ impl Caches {
                         pagination_status.clone(),
                         back_pagination_queue,
                     )
+                    .await?;
+
+                    timeline_is_not_empty =
+                        room_state.room_linked_chunk().revents().next().is_some();
+
+                    Ok(room_state)
                 },
             )
             .await?;
-
-        let timeline_is_not_empty =
-            room_state.read().await?.room_linked_chunk().revents().next().is_some();
 
         let room_event_cache = room::RoomEventCache::new(
             room_id.to_owned(),
@@ -369,10 +378,9 @@ impl Caches {
                 thread.handle_joined_room_update(timeline, read_receipts).await?;
 
                 if update_thread_summary {
-                    let new_thread_summary =
-                        thread.state().read().await?.compute_thread_summary().await?;
+                    let new_thread_summary = thread.update_thread_summary().await?;
 
-                    room.update_thread_summary(thread.thread_id(), new_thread_summary).await?;
+                    room.update_thread_summary(thread.thread_id(), new_thread_summary)?;
                 }
             }
         }
@@ -498,6 +506,13 @@ impl Caches {
         }
 
         Ok(events.into_iter())
+    }
+
+    /// Get all the events of this room saved in the store.
+    #[cfg(feature = "experimental-search")]
+    pub async fn stored_events(&self) -> Result<Vec<Event>> {
+        let state = self.internals.state.read().await?;
+        Ok(state.store.get_room_events(self.room.room_id(), None, None).await?)
     }
 
     /// Get all encrypted events from all the event caches managed by this

@@ -60,9 +60,7 @@ use super::{
 };
 use crate::{
     timeline::{
-        TimelineUniqueId,
-        algorithms::rfind_event_item,
-        controller::aggregations::{AggregationSendHandle, PendingEdit},
+        TimelineUniqueId, algorithms::rfind_event_item, controller::aggregations::PendingEdit,
         event_item::OtherMessageLike,
     },
     unable_to_decrypt_hook::UtdHookManager,
@@ -732,11 +730,9 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     fn new_aggregation(&self, kind: AggregationKind) -> Aggregation {
         let own_id = self.ctx.flow.timeline_item_id();
         match &self.ctx.flow {
-            Flow::Local { send_handle, .. } => Aggregation::new_local(
-                own_id,
-                kind,
-                send_handle.clone().map(AggregationSendHandle::Event),
-            ),
+            Flow::Local { send_handle, .. } => {
+                Aggregation::new_local(own_id, kind, send_handle.clone())
+            }
             Flow::Remote { .. } => Aggregation::new(own_id, kind),
         }
     }
@@ -916,17 +912,61 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             &self.meta.room_version_rules,
         );
 
-        // Even if the redacted event wasn't in the timeline, we can always
-        // update responses with a placeholder "redacted" embedded item.
+        // Update responses with a placeholder "redacted" embedded item. The
+        // placeholder must keep the redacted event's own sender and timestamp
+        // (not the redaction's, `self.ctx`): take them from the redacted item
+        // if it's in the timeline, else from a response's already-loaded
+        // details. With neither, leave the responses alone: their details get
+        // fetched from the (redacted) event itself.
+        let Some((sender, sender_profile, timestamp)) = self.redacted_event_identity(&redacted)
+        else {
+            trace!("redacted event unknown to the timeline, not updating responses");
+            return;
+        };
+
         let embedded_event = EmbeddedEvent {
             content: TimelineItemContent::MsgLike(MsgLikeContent::redacted()),
-            sender: self.ctx.sender.clone(),
-            sender_profile: TimelineDetails::from_initial_value(self.ctx.sender_profile.clone()),
-            timestamp: self.ctx.timestamp,
+            sender,
+            sender_profile,
+            timestamp,
             identifier: TimelineEventItemId::EventId(redacted.clone()),
         };
 
         Self::maybe_update_responses(self.meta, self.items, &redacted, embedded_event);
+    }
+
+    /// The sender, sender profile and timestamp of an event being redacted,
+    /// from its timeline item, or failing that from the loaded details of a
+    /// response to it.
+    fn redacted_event_identity(
+        &self,
+        redacted: &EventId,
+    ) -> Option<(OwnedUserId, TimelineDetails<Profile>, MilliSecondsSinceUnixEpoch)> {
+        let item_of = |event_id: &EventId| {
+            self.items
+                .get_remote_event_by_event_id(event_id)
+                .and_then(|meta| meta.timeline_item_index)
+                .and_then(|index| self.items.get(index))
+                .and_then(|item| item.as_event())
+        };
+
+        if let Some(item) = item_of(redacted) {
+            return Some((
+                item.sender().to_owned(),
+                item.sender_profile().clone(),
+                item.timestamp(),
+            ));
+        }
+
+        self.meta.replies.get(redacted)?.iter().find_map(|reply_id| {
+            let item = item_of(reply_id)?;
+            let TimelineDetails::Ready(embedded) =
+                &item.content.as_msglike()?.in_reply_to.as_ref()?.event
+            else {
+                return None;
+            };
+            Some((embedded.sender.clone(), embedded.sender_profile.clone(), embedded.timestamp))
+        })
     }
 
     /// Attempts to redact an aggregation (e.g. a reaction, a poll response,
@@ -1189,7 +1229,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 // Try to keep precise insertion semantics here, in this exact
                 // order:
                 //
-                // - _push back_ when the new item is inserted after all items (the assumption
+                // - _push back_ when the new item is inserted after all items
+                //   (the assumption
                 // being that this is the hot path, because most of the time new
                 // events come from the sync),
                 // - _push front_ when the new item is inserted at index 0,

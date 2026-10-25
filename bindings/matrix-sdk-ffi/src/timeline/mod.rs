@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
+// Allow UniFFI to use methods marked as `#[deprecated]`.
+#![allow(deprecated)]
+
+use std::{collections::HashMap, fmt::Write as _, fs, panic, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
 use eyeball_im::VectorDiff;
-use futures_util::pin_mut;
 use matrix_sdk::{
     attachment::{
         AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo, Thumbnail,
@@ -94,57 +96,49 @@ impl Timeline {
     pub(crate) fn new(inner: matrix_sdk_ui::timeline::Timeline) -> Arc<Self> {
         Arc::new(Self { inner })
     }
+}
 
-    fn send_attachment(
-        self: Arc<Self>,
-        params: UploadParameters,
-        attachment_info: AttachmentInfo,
-        mime_type: Option<String>,
-        thumbnail: Option<Thumbnail>,
-    ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let mime_str = mime_type.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+/// Builds the configuration shared by the methods sending or editing an
+/// attachment.
+fn build_attachment_config(
+    params: UploadParameters,
+    attachment: AttachmentKind,
+) -> Result<(UploadSource, Mime, AttachmentConfig), RoomError> {
+    let (attachment_info, mime_type, thumbnail) = attachment.into_parts()?;
 
-        let mime_type =
-            mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+    let mime_str = mime_type.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
 
-        let in_reply_to_event_id = params
-            .in_reply_to
-            .map(EventId::parse)
-            .transpose()
-            .map_err(|_| RoomError::InvalidRepliedToEventId)?;
+    let mime_type = mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
 
-        let caption = params.caption.map(|caption| {
-            let formatted =
-                formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into));
-            assign!(TextMessageEventContent::plain(caption), { formatted })
-        });
+    let in_reply_to_event_id = params
+        .in_reply_to
+        .map(EventId::parse)
+        .transpose()
+        .map_err(|_| RoomError::InvalidRepliedToEventId)?;
 
-        let extra_content: Option<serde_json::Map<String, serde_json::Value>> = params
-            .extra_content_json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()
-            .map_err(|_| RoomError::InvalidAttachmentData)?;
+    let caption = params.caption.map(|caption| {
+        let formatted =
+            formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into));
+        assign!(TextMessageEventContent::plain(caption), { formatted })
+    });
 
-        let attachment_config = AttachmentConfig {
-            info: Some(attachment_info),
-            thumbnail,
-            caption,
-            mentions: params.mentions.map(Into::into),
-            in_reply_to: in_reply_to_event_id,
-            extra_content,
-            ..Default::default()
-        };
+    let extra_content: Option<serde_json::Map<String, serde_json::Value>> = params
+        .extra_content_json
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|_| RoomError::InvalidAttachmentData)?;
 
-        let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
-            self.inner
-                .send_attachment(params.source, mime_type, attachment_config)
-                .use_send_queue()
-                .await
-                .map_err(|_| RoomError::FailedSendingAttachment)
-        }));
+    let attachment_config = AttachmentConfig {
+        info: Some(attachment_info),
+        thumbnail,
+        caption,
+        mentions: params.mentions.map(Into::into),
+        in_reply_to: in_reply_to_event_id,
+        extra_content,
+        ..Default::default()
+    };
 
-        Ok(handle)
-    }
+    Ok((params.source, mime_type, attachment_config))
 }
 
 fn build_thumbnail_info(
@@ -231,6 +225,62 @@ pub enum UploadSource {
     },
 }
 
+/// What kind of attachment is being sent or edited in, with the metadata that
+/// kind needs.
+#[derive(uniffi::Enum)]
+pub enum AttachmentKind {
+    Image { image_info: ImageInfo, thumbnail_source: Option<UploadSource> },
+    Video { video_info: VideoInfo, thumbnail_source: Option<UploadSource> },
+    Audio { audio_info: AudioInfo },
+    Voice { audio_info: AudioInfo, waveform: Vec<f32> },
+    File { file_info: FileInfo },
+}
+
+impl AttachmentKind {
+    fn into_parts(self) -> Result<(AttachmentInfo, Option<String>, Option<Thumbnail>), RoomError> {
+        Ok(match self {
+            Self::Image { image_info, thumbnail_source } => (
+                AttachmentInfo::Image(
+                    BaseImageInfo::try_from(&image_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                image_info.mimetype,
+                build_thumbnail_info(thumbnail_source, image_info.thumbnail_info)?,
+            ),
+            Self::Video { video_info, thumbnail_source } => (
+                AttachmentInfo::Video(
+                    BaseVideoInfo::try_from(&video_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                video_info.mimetype,
+                build_thumbnail_info(thumbnail_source, video_info.thumbnail_info)?,
+            ),
+            Self::Audio { audio_info } => (
+                AttachmentInfo::Audio(
+                    BaseAudioInfo::try_from(&audio_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                audio_info.mimetype,
+                None,
+            ),
+            Self::Voice { audio_info, waveform } => {
+                let mut info = BaseAudioInfo::try_from(&audio_info)
+                    .map_err(|_| RoomError::InvalidAttachmentData)?;
+                info.waveform = Some(waveform);
+                (AttachmentInfo::Voice(info), audio_info.mimetype, None)
+            }
+            Self::File { file_info } => (
+                AttachmentInfo::File(
+                    BaseFileInfo::try_from(&file_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                file_info.mimetype,
+                None,
+            ),
+        })
+    }
+}
+
 impl From<UploadSource> for AttachmentSource {
     fn from(value: UploadSource) -> Self {
         match value {
@@ -300,7 +350,7 @@ impl Timeline {
         listener.on_update(vec![TimelineDiff::new(VectorDiff::Reset { values: timeline_items })]);
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(timeline_stream);
+            let mut timeline_stream = pin!(timeline_stream);
 
             // Then forward new items.
             while let Some(diffs) = timeline_stream.next().await {
@@ -426,64 +476,94 @@ impl Timeline {
         }
     }
 
+    /// Sends an attachment, uploaded through the send queue.
+    pub fn send_attachment(
+        self: Arc<Self>,
+        params: UploadParameters,
+        attachment: AttachmentKind,
+    ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
+        let (source, mime_type, attachment_config) = build_attachment_config(params, attachment)?;
+
+        let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
+            self.inner
+                .send_attachment(source, mime_type, attachment_config)
+                .use_send_queue()
+                .await
+                .map_err(|_| RoomError::FailedSendingAttachment)
+        }));
+
+        Ok(handle)
+    }
+
+    /// Edits a message the current user sent into one with the given
+    /// attachment, replacing its attachment if it had one. The caption in
+    /// `params` is the whole new text: nothing of the original content is
+    /// kept, and `in_reply_to` is ignored.
+    pub async fn edit_with_attachment(
+        &self,
+        event_id: String,
+        params: UploadParameters,
+        attachment: AttachmentKind,
+    ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        let (source, mime_type, attachment_config) = build_attachment_config(params, attachment)?;
+
+        self.inner.edit_with_attachment(&event_id, source, mime_type, attachment_config).await?;
+
+        Ok(())
+    }
+
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Image`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_image(
         self: Arc<Self>,
         params: UploadParameters,
         thumbnail_source: Option<UploadSource>,
         image_info: ImageInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::Image(
-            BaseImageInfo::try_from(&image_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        let thumbnail = build_thumbnail_info(thumbnail_source, image_info.thumbnail_info)?;
-        self.send_attachment(params, attachment_info, image_info.mimetype, thumbnail)
+        self.send_attachment(params, AttachmentKind::Image { image_info, thumbnail_source })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Video`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_video(
         self: Arc<Self>,
         params: UploadParameters,
         thumbnail_source: Option<UploadSource>,
         video_info: VideoInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::Video(
-            BaseVideoInfo::try_from(&video_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        let thumbnail = build_thumbnail_info(thumbnail_source, video_info.thumbnail_info)?;
-        self.send_attachment(params, attachment_info, video_info.mimetype, thumbnail)
+        self.send_attachment(params, AttachmentKind::Video { video_info, thumbnail_source })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Audio`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_audio(
         self: Arc<Self>,
         params: UploadParameters,
         audio_info: AudioInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::Audio(
-            BaseAudioInfo::try_from(&audio_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        self.send_attachment(params, attachment_info, audio_info.mimetype, None)
+        self.send_attachment(params, AttachmentKind::Audio { audio_info })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Voice`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_voice_message(
         self: Arc<Self>,
         params: UploadParameters,
         audio_info: AudioInfo,
         waveform: Vec<f32>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let mut info =
-            BaseAudioInfo::try_from(&audio_info).map_err(|_| RoomError::InvalidAttachmentData)?;
-        info.waveform = Some(waveform);
-        self.send_attachment(params, AttachmentInfo::Voice(info), audio_info.mimetype, None)
+        self.send_attachment(params, AttachmentKind::Voice { audio_info, waveform })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::File`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_file(
         self: Arc<Self>,
         params: UploadParameters,
         file_info: FileInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::File(
-            BaseFileInfo::try_from(&file_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        self.send_attachment(params, attachment_info, file_info.mimetype, None)
+        self.send_attachment(params, AttachmentKind::File { file_info })
     }
 
     pub async fn create_poll(
@@ -1651,6 +1731,41 @@ mod galleries {
         mentions: Option<Mentions>,
         /// Optional Event ID to reply to.
         in_reply_to: Option<String>,
+        /// Additional top-level fields for the gallery, as a JSON object.
+        /// The gallery's own fields take precedence on conflicts.
+        #[uniffi(default = None)]
+        extra_content_json: Option<String>,
+    }
+
+    impl TryFrom<GalleryUploadParameters> for GalleryConfig {
+        type Error = RoomError;
+
+        fn try_from(params: GalleryUploadParameters) -> Result<Self, Self::Error> {
+            let caption = params.caption.map(|caption| {
+                let formatted =
+                    formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into));
+                assign!(TextMessageEventContent::plain(caption), { formatted })
+            });
+
+            let in_reply_to = params
+                .in_reply_to
+                .as_ref()
+                .map(EventId::parse)
+                .transpose()
+                .map_err(|_| RoomError::InvalidRepliedToEventId)?;
+
+            let extra_content = params
+                .extra_content_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|_| RoomError::InvalidAttachmentData)?;
+
+            Ok(GalleryConfig::new()
+                .caption(caption)
+                .mentions(params.mentions.map(Into::into))
+                .in_reply_to(in_reply_to)
+                .extra_content(extra_content))
+        }
     }
 
     #[derive(uniffi::Enum)]
@@ -1660,18 +1775,24 @@ mod galleries {
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
         },
         File {
             file_info: FileInfo,
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
         },
         Image {
             image_info: ImageInfo,
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
             thumbnail_source: Option<UploadSource>,
         },
         Video {
@@ -1679,11 +1800,22 @@ mod galleries {
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
             thumbnail_source: Option<UploadSource>,
         },
     }
 
     impl GalleryItemInfo {
+        fn extra_content_json(&self) -> &Option<String> {
+            match self {
+                GalleryItemInfo::Audio { extra_content_json, .. }
+                | GalleryItemInfo::File { extra_content_json, .. }
+                | GalleryItemInfo::Image { extra_content_json, .. }
+                | GalleryItemInfo::Video { extra_content_json, .. } => extra_content_json,
+            }
+        }
+
         fn mimetype(&self) -> &Option<String> {
             match self {
                 GalleryItemInfo::Audio { audio_info, .. } => &audio_info.mimetype,
@@ -1782,6 +1914,12 @@ mod galleries {
                 attachment_info: self.attachment_info()?,
                 caption,
                 thumbnail: self.thumbnail()?,
+                extra_content: self
+                    .extra_content_json()
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| RoomError::InvalidAttachmentData)?,
             })
         }
     }
@@ -1839,23 +1977,7 @@ mod galleries {
             params: GalleryUploadParameters,
             item_infos: Vec<GalleryItemInfo>,
         ) -> Result<Arc<SendGalleryJoinHandle>, RoomError> {
-            let caption = params.caption.map(|caption| {
-                let formatted =
-                    formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into));
-                assign!(TextMessageEventContent::plain(caption), { formatted })
-            });
-
-            let in_reply_to = params
-                .in_reply_to
-                .as_ref()
-                .map(EventId::parse)
-                .transpose()
-                .map_err(|_| RoomError::InvalidRepliedToEventId)?;
-
-            let mut gallery_config = GalleryConfig::new()
-                .caption(caption)
-                .mentions(params.mentions.map(Into::into))
-                .in_reply_to(in_reply_to);
+            let mut gallery_config: GalleryConfig = params.try_into()?;
 
             for item_info in item_infos {
                 gallery_config = gallery_config.add_item(item_info.try_into()?);
@@ -1868,6 +1990,69 @@ mod galleries {
             }));
 
             Ok(handle)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn gallery_params(extra_content_json: Option<&str>) -> GalleryUploadParameters {
+            GalleryUploadParameters {
+                caption: Some("gallery caption".to_owned()),
+                formatted_caption: None,
+                mentions: None,
+                in_reply_to: None,
+                extra_content_json: extra_content_json.map(str::to_owned),
+            }
+        }
+
+        fn image_item(extra_content_json: Option<&str>) -> GalleryItemInfo {
+            GalleryItemInfo::Image {
+                image_info: ImageInfo {
+                    height: None,
+                    width: None,
+                    mimetype: Some("image/jpeg".to_owned()),
+                    size: None,
+                    thumbnail_info: None,
+                    thumbnail_source: None,
+                    blurhash: None,
+                    is_animated: None,
+                },
+                source: UploadSource::Data {
+                    bytes: b"image".to_vec(),
+                    filename: "image.jpg".to_owned(),
+                },
+                caption: None,
+                formatted_caption: None,
+                thumbnail_source: None,
+                extra_content_json: extra_content_json.map(str::to_owned),
+            }
+        }
+
+        #[test]
+        fn test_gallery_extra_content_conversion() {
+            for json in [None, Some("{}"), Some(r#"{"com.example.gallery":true}"#)] {
+                assert!(GalleryConfig::try_from(gallery_params(json)).is_ok());
+            }
+
+            let item: matrix_sdk_ui::timeline::GalleryItemInfo =
+                image_item(Some(r#"{"org.matrix.msc2448.is_spoiler":true}"#)).try_into().unwrap();
+            let item: matrix_sdk::attachment::GalleryItemInfo = item.try_into().unwrap();
+            assert_eq!(item.extra_content.unwrap()["org.matrix.msc2448.is_spoiler"], true);
+        }
+
+        #[test]
+        fn test_gallery_extra_content_rejects_non_objects() {
+            for json in ["not JSON", "[]", "null", "true", "42", r#""text""#] {
+                assert!(matches!(
+                    GalleryConfig::try_from(gallery_params(Some(json))),
+                    Err(RoomError::InvalidAttachmentData)
+                ));
+                let item: Result<matrix_sdk_ui::timeline::GalleryItemInfo, _> =
+                    image_item(Some(json)).try_into();
+                assert!(matches!(item, Err(RoomError::InvalidAttachmentData)));
+            }
         }
     }
 }

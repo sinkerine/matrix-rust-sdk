@@ -24,9 +24,14 @@
 //! This avoids potential race conditions where a sync could be done, but the
 //! processing by the event cache isn't, at the time we check the unread counts.
 
-use std::time::Duration;
+use std::{ops::Not, sync::Arc, time::Duration};
 
-use matrix_sdk::{assert_let_timeout, sleep::sleep, test_utils::mocks::MatrixMockServer};
+use matrix_sdk::{
+    MemoryStore as MemoryStateStore, assert_let_timeout,
+    cross_process_lock::CrossProcessLockConfig, sleep::sleep, store::StoreConfig,
+    test_utils::mocks::MatrixMockServer,
+};
+use matrix_sdk_base::event_cache::store::MemoryStore;
 use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
     event_id,
@@ -45,9 +50,7 @@ async fn test_unread_count_new_message_no_receipt() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -89,8 +92,7 @@ async fn test_unread_count_new_message_with_known_receipt() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let own_user_id = client.user_id().unwrap();
     let room_id = room_id!("!r");
@@ -147,8 +149,7 @@ async fn test_unread_count_implicit_receipt_own_message() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -207,8 +208,7 @@ async fn test_unread_count_receipt_only_no_new_message() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -260,7 +260,11 @@ async fn test_unread_count_receipt_only_no_new_message() {
         )
         .await;
 
-    assert_let_timeout!(Ok(_) = thread_updates.recv());
+    // Wait for all updates to come.
+    while thread_updates.is_empty().not() {
+        assert_let_timeout!(Ok(_) = thread_updates.recv());
+        sleep(Duration::from_millis(500)).await;
+    }
 
     // Only ev3 (after the receipt) is unread now.
     assert_eq!(thread.num_unread_messages().await.unwrap(), 1);
@@ -276,8 +280,7 @@ async fn test_unread_count_pending_receipt() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -368,8 +371,7 @@ async fn test_unread_count_accumulates_across_syncs() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -412,7 +414,11 @@ async fn test_unread_count_accumulates_across_syncs() {
         )
         .await;
 
-    assert_let_timeout!(Ok(_) = thread_updates.recv());
+    // Wait for all updates to come.
+    while thread_updates.is_empty().not() {
+        assert_let_timeout!(Ok(_) = thread_updates.recv());
+        sleep(Duration::from_millis(500)).await;
+    }
 
     // Three messages are now unread in total.
     assert_eq!(thread.num_unread_messages().await.unwrap(), 3);
@@ -428,8 +434,7 @@ async fn test_state_event_does_not_increment_unread() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -461,8 +466,7 @@ async fn test_reaction_does_not_increment_unread() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -503,8 +507,7 @@ async fn test_mentions_increments_unread_mentions() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -556,8 +559,7 @@ async fn test_compute_unread_counts_considers_active_receipt() {
     let client = server.client_builder().build().await;
     let own_user_id = client.user_id().unwrap();
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -644,8 +646,7 @@ async fn test_unread_counts_updated_after_duplicate_only_sync_response() {
     let client = server.client_builder().build().await;
     let own_user_id = client.user_id().unwrap();
 
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
@@ -701,7 +702,11 @@ async fn test_unread_counts_updated_after_duplicate_only_sync_response() {
         )
         .await;
 
-    assert_let_timeout!(Ok(_) = thread_updates.recv());
+    // Wait for all updates to come.
+    while thread_updates.is_empty().not() {
+        assert_let_timeout!(Ok(_) = thread_updates.recv());
+        sleep(Duration::from_millis(500)).await;
+    }
 
     // The message counts are properly updated (zero new message unread after
     // $2).
@@ -715,10 +720,10 @@ async fn test_unread_counts_updated_after_duplicate_only_sync_response() {
 /// is selected for unread count computation.
 #[async_test]
 async fn test_read_receipt_from_store_used_as_latest_active() {
+    let state_store = Arc::new(MemoryStateStore::new());
+    let event_cache_store = MemoryStore::new();
     let server = MatrixMockServer::new().await;
-    let client = server.client_builder().build().await;
 
-    let own_user_id = client.user_id().unwrap();
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
     let f = EventFactory::new().room(room_id).sender(*ALICE);
@@ -726,25 +731,56 @@ async fn test_read_receipt_from_store_used_as_latest_active() {
     // Important test note: the read receipt must be in the state store _before_
     // the event cache is subscribed to, so that it's not marked as active at
     // start.
-    server
-        .sync_room(
-            &client,
-            JoinedRoomBuilder::new(room_id).add_receipt(
-                f.read_receipts()
-                    .add(
-                        event_id!("$2"),
-                        own_user_id,
-                        ReceiptType::Read,
-                        ReceiptThread::Thread(thread_id.to_owned()),
-                    )
-                    .into_event(),
-            ),
-        )
+    {
+        let client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new(CrossProcessLockConfig::MultiProcess {
+                        holder_name: "foo".to_owned(),
+                    })
+                    .state_store(state_store.clone())
+                    .event_cache_store(event_cache_store.clone()),
+                )
+            })
+            .build()
+            .await;
+
+        let own_user_id = client.user_id().unwrap();
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_receipt(
+                    f.read_receipts()
+                        .add(
+                            event_id!("$2"),
+                            own_user_id,
+                            ReceiptType::Read,
+                            ReceiptThread::Thread(thread_id.to_owned()),
+                        )
+                        .into_event(),
+                ),
+            )
+            .await;
+    }
+
+    // Now, let's rebuilt a client with the same event cache store.
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::MultiProcess {
+                    holder_name: "foo".to_owned(),
+                })
+                .state_store(state_store)
+                .event_cache_store(event_cache_store.clone()),
+            )
+        })
+        .build()
         .await;
 
-    // Then, subscribe the event cache.
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let (thread, _drop_handles) = event_cache.thread(room_id, thread_id).await.unwrap();
     let (_, mut thread_updates) = thread.subscribe().await.unwrap();

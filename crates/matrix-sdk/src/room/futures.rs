@@ -26,30 +26,29 @@ use eyeball::SharedObservable;
 use matrix_sdk_base::deserialized_responses::EncryptionInfo;
 use matrix_sdk_common::boxed_into_future;
 use mime::Mime;
+#[cfg(feature = "e2e-encryption")]
+use ruma::events::MessageLikeEventType;
 #[cfg(feature = "unstable-msc4354")]
 use ruma::events::sticky::StickyDurationMs;
 #[cfg(doc)]
 use ruma::events::{MessageLikeUnsigned, SyncMessageLikeEvent};
+#[cfg(feature = "experimental-encrypted-state-events")]
+use ruma::events::{StateEventContent, StateEventType};
 use ruma::{
     OwnedTransactionId, TransactionId,
-    api::client::message::send_message_event,
+    api::client::{message::send_message_event, state::send_state_event},
     assign,
-    events::{AnyMessageLikeEventContent, MessageLikeEventContent},
+    events::{AnyMessageLikeEventContent, AnyStateEventContent, MessageLikeEventContent},
     serde::Raw,
-};
-#[cfg(feature = "experimental-encrypted-state-events")]
-use ruma::{
-    api::client::state::send_state_event,
-    events::{AnyStateEventContent, StateEventContent},
 };
 use tracing::{Instrument, Span, info, trace};
 
 use super::Room;
-#[cfg(feature = "experimental-encrypted-state-events")]
-use crate::utils::IntoRawStateEventContent;
 use crate::{
-    Result, TransmissionProgress, attachment::AttachmentConfig, config::RequestConfig,
-    utils::IntoRawMessageLikeEventContent,
+    Result, TransmissionProgress,
+    attachment::AttachmentConfig,
+    config::RequestConfig,
+    utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
 };
 
 /// The result of the [`Room::send`] future
@@ -97,7 +96,7 @@ impl<'a> SendMessageLikeEvent<'a> {
     /// [`Client::supports_sticky_events`]: crate::Client::supports_sticky_events
     #[cfg(feature = "unstable-msc4354")]
     pub fn with_sticky_duration(mut self, duration: Duration) -> Self {
-        self.sticky_duration = Some(sticky_duration_ms(duration));
+        self.sticky_duration = Some(crate::utils::sticky_duration_ms(duration));
         self
     }
 
@@ -197,7 +196,7 @@ impl<'a> SendRawMessageLikeEvent<'a> {
     /// [`Client::supports_sticky_events`]: crate::Client::supports_sticky_events
     #[cfg(feature = "unstable-msc4354")]
     pub fn with_sticky_duration(mut self, duration: Duration) -> Self {
-        self.sticky_duration = Some(sticky_duration_ms(duration));
+        self.sticky_duration = Some(crate::utils::sticky_duration_ms(duration));
         self
     }
 
@@ -264,7 +263,7 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                 Span::current().record("is_room_encrypted", true);
                 // Reactions are currently famously not encrypted, skip
                 // encrypting them until they are.
-                if event_type == "m.reaction" {
+                if MessageLikeEventType::from(event_type) == MessageLikeEventType::Reaction {
                     trace!("Sending plaintext event because of the event type.");
                 } else {
                     trace!(
@@ -307,13 +306,6 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
 
         Box::pin(fut.instrument(tracing_span))
     }
-}
-
-/// Convert a `Duration` into the sticky duration of a request, clamped to one
-/// hour.
-#[cfg(feature = "unstable-msc4354")]
-fn sticky_duration_ms(duration: Duration) -> StickyDurationMs {
-    StickyDurationMs::new_clamped(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Future returned by [`Room::send_attachment`].
@@ -401,7 +393,6 @@ impl<'a> IntoFuture for SendAttachment<'a> {
 }
 
 /// Future returned by [`Room::send_state_event_raw`].
-#[cfg(feature = "experimental-encrypted-state-events")]
 #[allow(missing_debug_implementations)]
 pub struct SendRawStateEvent<'a> {
     room: &'a Room,
@@ -412,7 +403,6 @@ pub struct SendRawStateEvent<'a> {
     request_config: Option<RequestConfig>,
 }
 
-#[cfg(feature = "experimental-encrypted-state-events")]
 impl<'a> SendRawStateEvent<'a> {
     pub(crate) fn new(
         room: &'a Room,
@@ -452,6 +442,7 @@ impl<'a> SendRawStateEvent<'a> {
     ///
     /// Returns `true` if the event should be encrypted, otherwise returns
     /// `false`.
+    #[cfg(feature = "experimental-encrypted-state-events")]
     fn should_encrypt(room: &Room, event_type: &str) -> bool {
         if !room.encryption_state().is_state_encrypted() {
             trace!("Sending plaintext event as the room does NOT support encrypted state events.");
@@ -460,17 +451,17 @@ impl<'a> SendRawStateEvent<'a> {
 
         // Check the event is not critical.
         if matches!(
-            event_type,
-            "m.room.create"
-                | "m.room.member"
-                | "m.room.join_rules"
-                | "m.room.power_levels"
-                | "m.room.third_party_invite"
-                | "m.room.history_visibility"
-                | "m.room.guest_access"
-                | "m.room.encryption"
-                | "m.space.child"
-                | "m.space.parent"
+            StateEventType::from(event_type),
+            StateEventType::RoomCreate
+                | StateEventType::RoomMember
+                | StateEventType::RoomJoinRules
+                | StateEventType::RoomPowerLevels
+                | StateEventType::RoomThirdPartyInvite
+                | StateEventType::RoomHistoryVisibility
+                | StateEventType::RoomGuestAccess
+                | StateEventType::RoomEncryption
+                | StateEventType::SpaceChild
+                | StateEventType::SpaceParent
         ) {
             trace!("Sending plaintext event as its type is excluded from encryption.");
             return false;
@@ -480,20 +471,22 @@ impl<'a> SendRawStateEvent<'a> {
     }
 }
 
-#[cfg(feature = "experimental-encrypted-state-events")]
 impl<'a> IntoFuture for SendRawStateEvent<'a> {
     type Output = Result<send_state_event::v3::Response>;
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
+        #[cfg_attr(not(feature = "experimental-encrypted-state-events"), allow(unused_mut))]
         let Self { room, mut event_type, state_key, mut content, tracing_span, request_config } =
             self;
 
         let fut = async move {
             room.ensure_room_joined()?;
 
+            #[cfg_attr(not(feature = "experimental-encrypted-state-events"), allow(unused_mut))]
             let mut state_key = state_key.to_owned();
 
+            #[cfg(feature = "experimental-encrypted-state-events")]
             if Self::should_encrypt(room, event_type) {
                 use tracing::debug;
 
@@ -522,7 +515,7 @@ impl<'a> IntoFuture for SendRawStateEvent<'a> {
             let request = send_state_event::v3::Request::new_raw(
                 room.room_id().to_owned(),
                 event_type.into(),
-                state_key.to_owned(),
+                state_key,
                 content,
             );
 
