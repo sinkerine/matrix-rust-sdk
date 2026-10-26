@@ -43,6 +43,16 @@ pub async fn load(
     ids: Option<Vec<OwnedRoomId>>,
     private: bool,
 ) -> matrix_sdk::Result<Vec<ThreadBadge>> {
+    load_with_progress(client, ids, private, |_| {}).await
+}
+
+/// Publish classified threads while other rooms or histories are still loading.
+pub async fn load_with_progress(
+    client: &Client,
+    ids: Option<Vec<OwnedRoomId>>,
+    private: bool,
+    progress: impl Fn(ThreadBadge) + Send + Sync,
+) -> matrix_sdk::Result<Vec<ThreadBadge>> {
     let ids = match ids {
         Some(ids) => ids,
         None => {
@@ -62,7 +72,8 @@ pub async fn load(
         }
     }
     let mut pending =
-        stream::iter(rooms.into_iter().map(|room| load_room(room, private))).buffer_unordered(4);
+        stream::iter(rooms.into_iter().map(|room| load_room(room, private, &progress)))
+            .buffer_unordered(4);
     let mut badges = Vec::new();
     while let Some(result) = pending.next().await {
         badges.extend(result?);
@@ -70,7 +81,11 @@ pub async fn load(
     Ok(badges)
 }
 
-async fn load_room(room: Room, private: bool) -> matrix_sdk::Result<Vec<ThreadBadge>> {
+async fn load_room(
+    room: Room,
+    private: bool,
+    progress: &(impl Fn(ThreadBadge) + Send + Sync),
+) -> matrix_sdk::Result<Vec<ThreadBadge>> {
     let mut from = None;
     let mut tokens = HashSet::new();
     let mut roots = HashSet::new();
@@ -86,15 +101,15 @@ async fn load_room(room: Room, private: bool) -> matrix_sdk::Result<Vec<ThreadBa
         for root in page.chunk {
             let id = root.event_id().ok_or(matrix_sdk::Error::InsufficientData)?.to_owned();
             if roots.insert(id.clone()) {
-                badges.push(
-                    classify(
-                        &room,
-                        id,
-                        root.sender().as_deref() == Some(room.own_user_id()),
-                        private,
-                    )
-                    .await?,
-                );
+                let badge = classify(
+                    &room,
+                    id,
+                    root.sender().as_deref() == Some(room.own_user_id()),
+                    private,
+                )
+                .await?;
+                progress(badge.clone());
+                badges.push(badge);
             }
         }
         match page.prev_batch_token {

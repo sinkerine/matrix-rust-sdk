@@ -36,10 +36,26 @@ pub struct InboxRoom {
 /// Load a complete account snapshot. No room-list ranking or unread heuristic
 /// may be used here: a quiet room can contain an unread thread.
 pub async fn load(client: &Client) -> matrix_sdk::Result<Vec<InboxRoom>> {
-    let membership =
-        client.send(ruma::api::client::membership::joined_rooms::v3::Request::new()).await?;
-    let rooms = membership
-        .joined_rooms
+    load_with_progress(client, None, |_| {}).await
+}
+
+/// Emit each server page as soon as it is mapped. Completion of this future,
+/// rather than a page callback, indicates a complete account snapshot.
+pub async fn load_with_progress(
+    client: &Client,
+    ids: Option<Vec<OwnedRoomId>>,
+    progress: impl Fn(InboxRoom) + Send + Sync,
+) -> matrix_sdk::Result<Vec<InboxRoom>> {
+    let ids = match ids {
+        Some(ids) => ids,
+        None => {
+            client
+                .send(ruma::api::client::membership::joined_rooms::v3::Request::new())
+                .await?
+                .joined_rooms
+        }
+    };
+    let rooms = ids
         .into_iter()
         .map(|id| {
             client
@@ -48,12 +64,21 @@ pub async fn load(client: &Client) -> matrix_sdk::Result<Vec<InboxRoom>> {
                 .ok_or(matrix_sdk::Error::InsufficientData)
         })
         .collect::<matrix_sdk::Result<Vec<_>>>()?;
-    load_rooms(rooms).await
+    load_rooms_with_progress(rooms, progress).await
 }
 
 /// Reload changed rooms with bounded network concurrency.
 pub async fn load_rooms(rooms: Vec<Room>) -> matrix_sdk::Result<Vec<InboxRoom>> {
-    let mut pending = stream::iter(rooms.into_iter().map(load_room)).buffer_unordered(4);
+    load_rooms_with_progress(rooms, |_| {}).await
+}
+
+/// Stream independent room pages without waiting for slower rooms.
+pub async fn load_rooms_with_progress(
+    rooms: Vec<Room>,
+    progress: impl Fn(InboxRoom) + Send + Sync,
+) -> matrix_sdk::Result<Vec<InboxRoom>> {
+    let mut pending =
+        stream::iter(rooms.into_iter().map(|room| load_room(room, &progress))).buffer_unordered(4);
     let mut result = Vec::new();
     while let Some(room) = pending.next().await {
         result.push(room?);
@@ -62,7 +87,10 @@ pub async fn load_rooms(rooms: Vec<Room>) -> matrix_sdk::Result<Vec<InboxRoom>> 
     Ok(result)
 }
 
-async fn load_room(room: Room) -> matrix_sdk::Result<InboxRoom> {
+async fn load_room(
+    room: Room,
+    progress: &(impl Fn(InboxRoom) + Send + Sync),
+) -> matrix_sdk::Result<InboxRoom> {
     let mut from = None;
     let mut tokens = HashSet::new();
     let mut threads = HashMap::new();
@@ -70,18 +98,23 @@ async fn load_room(room: Room) -> matrix_sdk::Result<InboxRoom> {
         let page = room
             .list_threads(ListThreadsOptions {
                 from,
-                limit: Some(100u32.into()),
+                limit: Some(20u32.into()),
                 ..Default::default()
             })
             .await?;
+        let mut batch = Vec::new();
         for event in page.chunk {
             // A malformed root must fail the snapshot rather than silently
             // lower the account-wide badge count.
             let item = ThreadListService::build_thread_list_item(&room, event)
                 .await
                 .ok_or(matrix_sdk::Error::InsufficientData)?;
+            if !threads.contains_key(&item.root_event.event_id) {
+                batch.push(item.clone());
+            }
             threads.insert(item.root_event.event_id.clone(), item);
         }
+        progress(InboxRoom { room_id: room.room_id().to_owned(), threads: batch });
         match page.prev_batch_token {
             Some(token) if tokens.insert(token.clone()) => from = Some(token),
             Some(_) => return Err(matrix_sdk::Error::InsufficientData),
@@ -130,6 +163,39 @@ mod tests {
         let snapshot = load_rooms(client.joined_rooms()).await.unwrap();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].threads.len(), 2);
+    }
+
+    #[async_test]
+    async fn test_emits_first_page_before_later_page_failure() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let id = room_id!("!quiet:example.org");
+        let f = EventFactory::new().room(id).sender(user_id!("@alice:example.org"));
+        server
+            .mock_room_threads()
+            .ok(
+                vec![f.text_msg("root").event_id(event_id!("$one")).into_raw()],
+                Some("page2".into()),
+            )
+            .mock_once()
+            .mount()
+            .await;
+        server
+            .mock_room_threads()
+            .match_from("page2")
+            .ok(vec![], Some("page2".into()))
+            .mount()
+            .await;
+        server.sync_joined_room(&client, id).await;
+        let pages = std::sync::Mutex::new(Vec::new());
+        let result = super::load_rooms_with_progress(client.joined_rooms(), |page| {
+            pages.lock().unwrap().push(page);
+        })
+        .await;
+        assert!(result.is_err());
+        let pages = pages.lock().unwrap();
+        assert_eq!(pages[0].threads.len(), 1);
+        assert_eq!(pages[0].threads[0].root_event.event_id, event_id!("$one"));
     }
 
     #[async_test]

@@ -21,6 +21,57 @@ pub struct ThreadInboxRoom {
     pub threads: Vec<ThreadListItem>,
 }
 
+/// Incremental server pages. The loading future signals completion or failure.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait ThreadInboxPageListener: SendOutsideWasm + SyncOutsideWasm + Debug {
+    fn on_page(&self, room: ThreadInboxRoom);
+}
+
+pub(crate) async fn load_pages(
+    client: &matrix_sdk::Client,
+    room_ids: Option<Vec<String>>,
+    listener: Box<dyn ThreadInboxPageListener>,
+) -> Result<(), ClientError> {
+    let ids = room_ids
+        .map(|ids| ids.into_iter().map(ruma::RoomId::parse).collect::<Result<Vec<_>, _>>())
+        .transpose()?;
+    matrix_sdk_ui::thread_inbox::load_with_progress(client, ids, |room| {
+        listener.on_page(ThreadInboxRoom {
+            room_id: room.room_id.to_string(),
+            threads: room.threads.into_iter().map(Into::into).collect(),
+        });
+    })
+    .await?;
+    Ok(())
+}
+
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait ThreadInboxBadgeListener: SendOutsideWasm + SyncOutsideWasm + Debug {
+    fn on_badge(&self, badge: ThreadInboxBadge);
+}
+
+pub(crate) async fn load_badge_pages(
+    client: &matrix_sdk::Client,
+    room_ids: Option<Vec<String>>,
+    private: bool,
+    listener: Box<dyn ThreadInboxBadgeListener>,
+) -> Result<(), ClientError> {
+    let ids = room_ids
+        .map(|ids| ids.into_iter().map(ruma::RoomId::parse).collect::<Result<Vec<_>, _>>())
+        .transpose()?;
+    matrix_sdk_ui::thread_badges::load_with_progress(client, ids, private, |badge| {
+        listener.on_badge(ThreadInboxBadge {
+            room_id: badge.room_id.to_string(),
+            thread_id: badge.thread_id.to_string(),
+            unread: badge.unread,
+            mentions: badge.mentions,
+            participating: badge.participating,
+        });
+    })
+    .await?;
+    Ok(())
+}
+
 /// Compact state for badge-only refreshes while the inbox is closed.
 #[derive(uniffi::Record)]
 pub struct ThreadInboxBadge {

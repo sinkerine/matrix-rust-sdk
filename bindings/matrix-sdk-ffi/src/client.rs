@@ -1820,9 +1820,29 @@ impl Client {
         crate::thread_inbox::load(&self.inner, room_ids).await
     }
 
+    /// Deliver thread-list pages incrementally. The future completes only after
+    /// all selected rooms and pages have been scanned successfully.
+    pub async fn load_thread_inbox_pages(
+        &self,
+        room_ids: Option<Vec<String>>,
+        listener: Box<dyn crate::thread_inbox::ThreadInboxPageListener>,
+    ) -> Result<(), ClientError> {
+        crate::thread_inbox::load_pages(&self.inner, room_ids, listener).await
+    }
+
     /// Refresh compact unread badge state without constructing UI timelines or previews.
     pub async fn load_thread_inbox_badges(&self, room_ids: Option<Vec<String>>, private: bool) -> Result<Vec<crate::thread_inbox::ThreadInboxBadge>, ClientError> {
         crate::thread_inbox::load_badges(&self.inner, room_ids, private).await
+    }
+
+    /// Stream compact badge classifications; completion indicates a complete scan.
+    pub async fn load_thread_inbox_badge_pages(
+        &self,
+        room_ids: Option<Vec<String>>,
+        private: bool,
+        listener: Box<dyn crate::thread_inbox::ThreadInboxBadgeListener>,
+    ) -> Result<(), ClientError> {
+        crate::thread_inbox::load_badge_pages(&self.inner, room_ids, private, listener).await
     }
 
     /// Observe all rooms, including receipt-only sync updates. Subscribe before
