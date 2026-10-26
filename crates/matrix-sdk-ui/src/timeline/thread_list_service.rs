@@ -381,7 +381,12 @@ impl ThreadListService {
         timeline_event: TimelineEvent,
     ) -> Option<ThreadListItemEvent> {
         let event_id = timeline_event.event_id()?.to_owned();
-        let timestamp = timeline_event.timestamp()?;
+        // A bundled reply is newer than its root. The generic bundled-event
+        // timestamp is capped at the root timestamp, so use the reply's own
+        // timestamp here (still clamped to now for malicious future values).
+        let timestamp = timeline_event.raw().get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts").ok().flatten()
+            .map(|timestamp| timestamp.min(MilliSecondsSinceUnixEpoch::now()))
+            .or_else(|| timeline_event.timestamp())?;
         let sender = timeline_event.sender()?;
         let is_own = room.own_user_id() == sender;
         let sender_profile =
@@ -523,7 +528,7 @@ impl ThreadListService {
                             if refreshed_item
                                 .latest_event
                                 .as_ref()
-                                .is_none_or(|current| latest_event.timestamp > current.timestamp)
+                                .is_none_or(|current| current.event_id != latest_event.event_id && latest_event.timestamp > current.timestamp)
                             {
                                 refreshed_item.latest_event = Some(latest_event.clone());
                                 refreshed_item.num_replies =

@@ -21,6 +21,37 @@ pub struct ThreadInboxRoom {
     pub threads: Vec<ThreadListItem>,
 }
 
+/// Compact state for badge-only refreshes while the inbox is closed.
+#[derive(uniffi::Record)]
+pub struct ThreadInboxBadge {
+    pub room_id: String,
+    pub thread_id: String,
+    pub unread: u64,
+    pub mentions: u64,
+    pub participating: bool,
+}
+
+pub(crate) async fn load_badges(
+    client: &matrix_sdk::Client,
+    room_ids: Option<Vec<String>>,
+    private: bool,
+) -> Result<Vec<ThreadInboxBadge>, ClientError> {
+    let ids = room_ids
+        .map(|ids| ids.into_iter().map(ruma::RoomId::parse).collect::<Result<Vec<_>, _>>())
+        .transpose()?;
+    Ok(matrix_sdk_ui::thread_badges::load(client, ids, private)
+        .await?
+        .into_iter()
+        .map(|badge| ThreadInboxBadge {
+            room_id: badge.room_id.to_string(),
+            thread_id: badge.thread_id.to_string(),
+            unread: badge.unread,
+            mentions: badge.mentions,
+            participating: badge.participating,
+        })
+        .collect())
+}
+
 /// Invalidates account data after sync, including receipt-only updates.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait ThreadInboxListener: SendOutsideWasm + SyncOutsideWasm + Debug {

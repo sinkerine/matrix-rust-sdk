@@ -1820,6 +1820,11 @@ impl Client {
         crate::thread_inbox::load(&self.inner, room_ids).await
     }
 
+    /// Refresh compact unread badge state without constructing UI timelines or previews.
+    pub async fn load_thread_inbox_badges(&self, room_ids: Option<Vec<String>>, private: bool) -> Result<Vec<crate::thread_inbox::ThreadInboxBadge>, ClientError> {
+        crate::thread_inbox::load_badges(&self.inner, room_ids, private).await
+    }
+
     /// Observe all rooms, including receipt-only sync updates. Subscribe before
     /// loading the first inbox snapshot to avoid losing concurrent changes.
     pub fn subscribe_to_thread_inbox_updates(
