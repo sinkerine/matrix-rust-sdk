@@ -110,17 +110,19 @@ async fn classify(
     room: &Room,
     root: OwnedEventId,
     mut participating: bool,
-    private: bool,
+    _private: bool,
 ) -> matrix_sdk::Result<ThreadBadge> {
-    let receipt = room
-        .load_user_receipt(
-            if private { ReceiptType::ReadPrivate } else { ReceiptType::Read },
-            &ReceiptThread::Thread(root.clone()),
-            room.own_user_id(),
-        )
-        .await?;
-    let receipt = receipt.map(|(id, _)| id);
-    let mut after = receipt.is_none() || receipt.as_ref() == Some(&root);
+    let mut receipts = HashSet::new();
+    for kind in [ReceiptType::Read, ReceiptType::ReadPrivate] {
+        if let Some((id, _)) = room
+            .load_user_receipt(kind, &ReceiptThread::Thread(root.clone()), room.own_user_id())
+            .await?
+        {
+            receipts.insert(id);
+        }
+    }
+    let mut remaining = receipts.clone();
+    remaining.remove(&root);
     let mut from = None;
     let mut tokens = HashSet::new();
     let mut events = HashSet::new();
@@ -146,7 +148,13 @@ async fn classify(
             }
             let own = event.sender().as_deref() == Some(room.own_user_id());
             participating |= own;
-            if after && !own {
+            // Forward event order determines the later public/private boundary.
+            // Reset at either receipt; timestamps can be skewed or absent.
+            if receipts.contains(&id) {
+                remaining.remove(&id);
+                unread = 0;
+                mentions = 0;
+            } else if !own {
                 let json: serde_json::Value = serde_json::from_str(event.raw().json().get())
                     .map_err(|_| matrix_sdk::Error::InsufficientData)?;
                 if json.get("type").and_then(|v| v.as_str()) == Some("m.room.encrypted") {
@@ -162,9 +170,6 @@ async fn classify(
                     mentions += 1;
                 }
             }
-            if receipt.as_ref() == Some(&id) {
-                after = true;
-            }
         }
         match page.next_batch_token {
             Some(token) if tokens.insert(token.clone()) => from = Some(token),
@@ -172,7 +177,7 @@ async fn classify(
             None => break,
         }
     }
-    if !after {
+    if !remaining.is_empty() {
         return Err(matrix_sdk::Error::InsufficientData);
     }
     Ok(ThreadBadge {
