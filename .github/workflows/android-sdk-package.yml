@@ -71,7 +71,7 @@ jobs:
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            'https://api.github.com/users/15cm/packages/maven/org.matrix.rustcomponents%3Asdk-android/versions')
+            'https://api.github.com/users/sinkerine/packages/maven/org.matrix.rustcomponents%3Asdk-android/versions')
           if [ "$status" = 200 ]; then
             if jq -e '.[] | select(.name == "26.09.9-custom.1")' \
               "$RUNNER_TEMP/package-versions.json" >/dev/null; then
@@ -100,7 +100,7 @@ jobs:
               if (sdk != null) {
                   sdk.publishing.repositories.maven {
                       name = 'GitHubPackages'
-                      url = uri('https://maven.pkg.github.com/15cm/matrix-rust-sdk')
+                      url = uri('https://maven.pkg.github.com/sinkerine/matrix-rust-sdk')
                       credentials {
                           username = System.getenv('GITHUB_ACTOR')
                           password = System.getenv('GITHUB_TOKEN')
