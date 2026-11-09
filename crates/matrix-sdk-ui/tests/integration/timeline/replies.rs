@@ -22,7 +22,10 @@ use ruma::{
             encrypted::{
                 EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
             },
-            message::{Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+            message::{
+                AddMentions, Relation, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation,
+            },
         },
         sticker::{StickerEventContent, StickerMediaSource},
     },
@@ -751,6 +754,72 @@ async fn test_send_reply() {
 }
 
 #[async_test]
+async fn test_send_reply_with_extra_content() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let timeline = room.timeline().await.unwrap();
+    let target = event_id!("$target");
+    let f = EventFactory::new();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("Hello from Bob").sender(User::Bob).event_id(target),
+            ),
+        )
+        .await;
+
+    timeline.clear().await;
+    let (_, mut timeline_stream) =
+        timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
+
+    let command = json!({ "command": "model", "arguments": { "name": "gpt-5" } });
+    let expected_command = command.clone();
+    server
+        .mock_room_send()
+        .respond_with(move |req: &Request| {
+            let body = req.body_json::<serde_json::Value>().unwrap();
+            assert_eq!(body["m.relates_to"]["m.in_reply_to"]["event_id"], target.as_str());
+            assert!(body["m.relates_to"].get("rel_type").is_none());
+            assert_eq!(body["org.matrix.msc4391.command"], expected_command);
+            assert_eq!(body["m.mentions"], json!({ "user_ids": [CAROL.as_str()] }));
+            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$reply_event" }))
+        })
+        .expect(1)
+        .mount()
+        .await;
+
+    timeline
+        .send_reply_with_extra_content(
+            RoomMessageEventContentWithoutRelation::text_plain("/model gpt-5")
+                .add_mentions(Mentions::with_user_ids([CAROL.to_owned()])),
+            target.to_owned(),
+            AddMentions::No,
+            Some(serde_json::Map::from_iter([("org.matrix.msc4391.command".to_owned(), command)])),
+        )
+        .await
+        .unwrap();
+    yield_now().await;
+
+    let local_echo = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
+    assert_matches!(local_echo.send_state(), Some(EventSendState::NotSentYet { progress: None }));
+    assert_eq!(local_echo.content().as_message().unwrap().body(), "/model gpt-5");
+    let local_message = local_echo.content().as_msglike().unwrap();
+    assert_eq!(local_message.in_reply_to.as_ref().unwrap().event_id, target);
+    assert!(local_message.thread_root.is_none());
+    let diff = timeout(timeline_stream.next(), Duration::from_secs(1)).await.unwrap().unwrap();
+    assert_let!(VectorDiff::Set { value: remote_echo, .. } = diff);
+    assert_matches!(remote_echo.send_state(), Some(EventSendState::Sent { .. }));
+    assert_eq!(remote_echo.content().as_message().unwrap().body(), "/model gpt-5");
+    let remote_message = remote_echo.content().as_msglike().unwrap();
+    assert_eq!(remote_message.in_reply_to.as_ref().unwrap().event_id, target);
+    assert!(remote_message.thread_root.is_none());
+}
+
+#[async_test]
 async fn test_send_reply_can_be_aborted() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
@@ -1243,6 +1312,93 @@ async fn test_send_reply_enforce_thread_is_reply() {
     let in_reply_to = msglike_reply_message.in_reply_to.clone().unwrap();
     assert_eq!(in_reply_to.event_id, event_id_from_bob);
     assert_eq!(msglike_reply_message.thread_root.clone().unwrap(), thread_root);
+}
+
+#[async_test]
+async fn test_send_reply_with_extra_content_in_thread() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let timeline = room.timeline().await.unwrap();
+    let target = event_id!("$target");
+    let f = EventFactory::new();
+    let thread_root = event_id!("$root");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("Root from Bob").sender(User::Bob).event_id(thread_root),
+                )
+                .add_timeline_event(
+                    f.text_msg("Hello from Bob")
+                        .sender(User::Bob)
+                        .event_id(target)
+                        .in_thread(thread_root, thread_root),
+                ),
+        )
+        .await;
+
+    let thread_timeline = room
+        .timeline_builder()
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root.to_owned() })
+        .build()
+        .await
+        .unwrap();
+
+    timeline.clear().await;
+    let (_, mut timeline_stream) =
+        timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
+
+    let command = json!({ "command": "model", "arguments": { "name": "gpt-5" } });
+    let expected_command = command.clone();
+    server
+        .mock_room_send()
+        .respond_with(move |req: &Request| {
+            let body = req.body_json::<serde_json::Value>().unwrap();
+            assert_eq!(body["m.relates_to"]["m.in_reply_to"]["event_id"], target.as_str());
+            assert_eq!(body["m.relates_to"]["rel_type"], "m.thread");
+            assert_eq!(body["m.relates_to"]["event_id"], thread_root.as_str());
+            // Ruma omits `is_falling_back` when false, its default value.
+            let reply: RoomMessageEventContent = serde_json::from_value(body.clone()).unwrap();
+            assert_matches!(reply.relates_to, Some(Relation::Thread(thread)) => {
+                assert!(!thread.is_falling_back);
+            });
+            assert_eq!(body["org.matrix.msc4391.command"], expected_command);
+            assert_eq!(body["m.mentions"], json!({ "user_ids": [CAROL.as_str()] }));
+            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$reply_event" }))
+        })
+        .expect(1)
+        .mount()
+        .await;
+
+    thread_timeline
+        .send_reply_with_extra_content(
+            RoomMessageEventContentWithoutRelation::text_plain("/model gpt-5")
+                .add_mentions(Mentions::with_user_ids([CAROL.to_owned()])),
+            target.to_owned(),
+            AddMentions::No,
+            Some(serde_json::Map::from_iter([("org.matrix.msc4391.command".to_owned(), command)])),
+        )
+        .await
+        .unwrap();
+    yield_now().await;
+
+    let local_echo = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
+    assert_matches!(local_echo.send_state(), Some(EventSendState::NotSentYet { progress: None }));
+    assert_eq!(local_echo.content().as_message().unwrap().body(), "/model gpt-5");
+    let local_message = local_echo.content().as_msglike().unwrap();
+    assert_eq!(local_message.in_reply_to.as_ref().unwrap().event_id, target);
+    assert_eq!(local_message.thread_root.as_deref(), Some(thread_root));
+    let diff = timeout(timeline_stream.next(), Duration::from_secs(1)).await.unwrap().unwrap();
+    assert_let!(VectorDiff::Set { value: remote_echo, .. } = diff);
+    assert_matches!(remote_echo.send_state(), Some(EventSendState::Sent { .. }));
+    assert_eq!(remote_echo.content().as_message().unwrap().body(), "/model gpt-5");
+    let remote_message = remote_echo.content().as_msglike().unwrap();
+    assert_eq!(remote_message.in_reply_to.as_ref().unwrap().event_id, target);
+    assert_eq!(remote_message.thread_root.as_deref(), Some(thread_root));
 }
 
 #[async_test]

@@ -5,11 +5,13 @@
 
 //! Complete account-wide thread discovery exposed to mobile clients.
 
+use std::{fmt::Debug, sync::Arc};
+
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
+
 use crate::{
     ClientError, TaskHandle, runtime::get_runtime_handle, timeline::threads::ThreadListItem,
 };
-use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
-use std::{fmt::Debug, sync::Arc};
 
 /// All threads in a joined room. Empty rooms are included so consumers can
 /// reconcile removals without retaining stale unread badges.
@@ -139,7 +141,7 @@ pub(crate) async fn load(
     let snapshots = if let Some(ids) = room_ids {
         let ids = ids
             .into_iter()
-            .map(|id| ruma::RoomId::parse(id))
+            .map(ruma::RoomId::parse)
             .collect::<Result<std::collections::HashSet<_>, _>>()?;
         let rooms =
             client.joined_rooms().into_iter().filter(|room| ids.contains(room.room_id())).collect();

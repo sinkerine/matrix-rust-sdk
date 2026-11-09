@@ -26,11 +26,11 @@ pub mod room_list_service;
 pub mod search_service;
 pub mod spaces;
 pub mod sync_service;
-pub mod timeline;
-pub mod thread_inbox;
 pub mod thread_badges;
 #[cfg(test)]
 mod thread_badges_tests;
+pub mod thread_inbox;
+pub mod timeline;
 pub mod unable_to_decrypt_hook;
 
 pub use self::{room_list_service::RoomListService, timeline::Timeline};

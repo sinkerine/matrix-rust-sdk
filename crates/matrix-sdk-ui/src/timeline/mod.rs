@@ -475,12 +475,31 @@ impl Timeline {
         content: RoomMessageEventContentWithoutRelation,
         in_reply_to: OwnedEventId,
     ) -> Result<SendHandle, Error> {
-        let reply = self
+        self.send_reply_with_extra_content(content, in_reply_to, AddMentions::Yes, None).await
+    }
+
+    /// Like [`Self::send_reply`], but with additional top-level fields merged
+    /// into the content (the event's own fields win on conflicts, as in
+    /// [`Self::send_with_extra_content`]).
+    ///
+    /// With `add_mentions` set to [`AddMentions::Yes`], the replied-to sender
+    /// is added to `m.mentions`, unless it is the current user. With
+    /// [`AddMentions::No`], `content`'s mentions are sent unchanged.
+    #[instrument(skip(self, content, extra_content))]
+    pub async fn send_reply_with_extra_content(
+        &self,
+        content: RoomMessageEventContentWithoutRelation,
+        in_reply_to: OwnedEventId,
+        add_mentions: AddMentions,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<SendHandle, Error> {
+        let mut reply = self
             .infer_reply(Some(in_reply_to))
             .await
             .expect("the reply will always be set because we provided a replied-to event id");
+        reply.add_mentions = add_mentions;
         let content = self.room().make_reply_event(content, reply).await?;
-        self.send(content.into()).await
+        self.send_with_extra_content(content.into(), extra_content).await
     }
 
     /// Send a location event to the room, with `body` as the plain-text

@@ -53,7 +53,8 @@ use ruma::{
             },
         },
         room::message::{
-            MessageType, RoomMessageEventContentWithoutRelation, TextMessageEventContent,
+            AddMentions, MessageType, RoomMessageEventContentWithoutRelation,
+            TextMessageEventContent,
         },
     },
 };
@@ -635,8 +636,28 @@ impl Timeline {
         msg: Arc<RoomMessageEventContentWithoutRelation>,
         event_id: String,
     ) -> Result<Arc<SendHandle>, ClientError> {
+        self.send_reply_with_extra_content(msg, event_id, None, true).await
+    }
+
+    /// Like [`Self::send_reply`], but merges the given additional top-level
+    /// fields (a JSON object, encoded as a string) into the reply's content.
+    /// When `add_mentions` is false, the replied-to sender isn't added to
+    /// `m.mentions`; the message's own mentions are sent unchanged.
+    pub async fn send_reply_with_extra_content(
+        &self,
+        msg: Arc<RoomMessageEventContentWithoutRelation>,
+        event_id: String,
+        extra_content_json: Option<String>,
+        add_mentions: bool,
+    ) -> Result<Arc<SendHandle>, ClientError> {
         let event_id = EventId::parse(&event_id).map_err(|_| RoomError::InvalidRepliedToEventId)?;
-        let handle = self.inner.send_reply((*msg).clone(), event_id).await?;
+        let extra_content: Option<serde_json::Map<String, serde_json::Value>> =
+            extra_content_json.map(|json| serde_json::from_str(&json)).transpose()?;
+        let add_mentions = if add_mentions { AddMentions::Yes } else { AddMentions::No };
+        let handle = self
+            .inner
+            .send_reply_with_extra_content((*msg).clone(), event_id, add_mentions, extra_content)
+            .await?;
         Ok(Arc::new(SendHandle::new(handle)))
     }
 

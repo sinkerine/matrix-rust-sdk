@@ -1830,12 +1830,18 @@ impl Client {
         crate::thread_inbox::load_pages(&self.inner, room_ids, listener).await
     }
 
-    /// Refresh compact unread badge state without constructing UI timelines or previews.
-    pub async fn load_thread_inbox_badges(&self, room_ids: Option<Vec<String>>, private: bool) -> Result<Vec<crate::thread_inbox::ThreadInboxBadge>, ClientError> {
+    /// Refresh compact unread badge state without constructing UI timelines or
+    /// previews.
+    pub async fn load_thread_inbox_badges(
+        &self,
+        room_ids: Option<Vec<String>>,
+        private: bool,
+    ) -> Result<Vec<crate::thread_inbox::ThreadInboxBadge>, ClientError> {
         crate::thread_inbox::load_badges(&self.inner, room_ids, private).await
     }
 
-    /// Stream compact badge classifications; completion indicates a complete scan.
+    /// Stream compact badge classifications; completion indicates a complete
+    /// scan.
     pub async fn load_thread_inbox_badge_pages(
         &self,
         room_ids: Option<Vec<String>>,

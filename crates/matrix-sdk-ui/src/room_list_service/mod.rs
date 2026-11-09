@@ -56,7 +56,11 @@ mod room_list;
 pub mod sorters;
 mod state;
 
-use std::{pin::pin, sync::Arc, time::Duration};
+use std::{
+    pin::pin,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use async_stream::stream;
 use eyeball::Subscriber;
@@ -105,10 +109,18 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomRetention, ""),
 ];
 
-/// The default `required_state` constant value for sliding sync room
-/// subscriptions that must be added to `DEFAULT_REQUIRED_STATE`.
-const DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE: &[(StateEventType, &str)] =
-    &[(StateEventType::RoomPinnedEvents, "")];
+/// The default `required_state` value for sliding sync room subscriptions,
+/// added to `DEFAULT_REQUIRED_STATE`. Only opened (subscribed) rooms need it.
+///
+/// It's a `LazyLock` because `StateEventType::from` isn't `const`.
+static DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE: LazyLock<[(StateEventType, &str); 2]> =
+    LazyLock::new(|| {
+        [
+            (StateEventType::RoomPinnedEvents, ""),
+            // MSC4391 bot command descriptions, one state event per command.
+            (StateEventType::from("org.matrix.msc4391.command_description"), "*"),
+        ]
+    });
 
 /// The default Sliding Sync connection ID for the room list service.
 pub(crate) const DEFAULT_CONNECTION_ID: &str = "room-list";
@@ -623,6 +635,25 @@ mod tests {
     use ruma::{api::client::sync::sync_events::v5, assign, uint};
 
     use super::{ALL_ROOMS_LIST_NAME, Error, RoomListService, State};
+
+    #[test]
+    fn test_room_subscription_required_state_includes_msc4391_command_descriptions() {
+        let settings = super::room_subscription_settings();
+        let command_type =
+            ruma::events::StateEventType::from("org.matrix.msc4391.command_description");
+        let expected: Vec<_> = super::DEFAULT_REQUIRED_STATE
+            .iter()
+            .map(|(event_type, key)| (event_type.clone(), (*key).to_owned()))
+            .chain([
+                (ruma::events::StateEventType::RoomPinnedEvents, String::new()),
+                (command_type.clone(), "*".to_owned()),
+            ])
+            .collect();
+        assert_eq!(settings.required_state, expected);
+        assert!(
+            super::DEFAULT_REQUIRED_STATE.iter().all(|(event_type, _)| *event_type != command_type)
+        );
+    }
 
     #[async_test]
     async fn test_all_rooms_are_declared() -> Result<(), TestError> {

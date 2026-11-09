@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Account-wide thread discovery. A snapshot is complete only after every joined
-//! room and every page has been loaded successfully. Concurrency bounds work in
-//! flight, never the set of rooms or threads included in the result.
+//! Account-wide thread discovery. A snapshot is complete only after every
+//! joined room and every page has been loaded successfully. Concurrency bounds
+//! work in flight, never the set of rooms or threads included in the result.
 
 use std::collections::{HashMap, HashSet};
 
