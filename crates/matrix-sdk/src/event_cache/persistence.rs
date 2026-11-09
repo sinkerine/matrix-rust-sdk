@@ -172,6 +172,16 @@ pub(super) async fn send_updates_to_store(
         return Ok(());
     }
 
+    let bundled_edits = updates
+        .iter()
+        .flat_map(|update| match update {
+            Update::PushItems { items, .. } => items.as_slice(),
+            Update::ReplaceItem { item, .. } => std::slice::from_ref(item),
+            _ => &[],
+        })
+        .filter_map(Event::bundled_edit)
+        .collect::<Vec<_>>();
+
     // Strip relations from updates which insert or replace items.
     //
     // The reason we're doing this, is that consumers of the event cache might
@@ -213,6 +223,18 @@ pub(super) async fn send_updates_to_store(
 
     spawn(async move {
         trace!(updates = ?cloned_updates, "sending linked chunk updates to the store");
+
+        // Keep replacements available to relation lookups after stripping the
+        // original. An already stored event may have been redacted or decrypted
+        // since this aggregate was generated; never overwrite it with a bundle.
+        let room_id = cloned_linked_chunk_id.room_id();
+        for edit in bundled_edits {
+            if let Some(event_id) = edit.event_id()
+                && store.find_event(room_id, event_id).await?.is_none()
+            {
+                store.save_event(room_id, edit).await?;
+            }
+        }
 
         store.handle_linked_chunk_updates(cloned_linked_chunk_id.as_ref(), cloned_updates).await?;
         trace!("linked chunk updates applied");
@@ -416,4 +438,97 @@ pub async fn find_event_relations(
     let related = related.into_iter().map(|(event, _pos)| event).collect();
 
     Ok(related)
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk_base::{
+        cross_process_lock::CrossProcessLockConfig,
+        event_cache::store::{EventCacheStoreLock, MemoryStore},
+        linked_chunk::{ChunkIdentifier, Position},
+    };
+    use matrix_sdk_common::cross_process_lock::MappedCrossProcessLockState;
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
+    use ruma::{
+        event_id,
+        events::room::message::{
+            RedactedRoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+        },
+        room_id, user_id,
+    };
+
+    use super::*;
+
+    #[async_test]
+    async fn test_bundled_edit_is_saved_once_without_overwriting_stored_redaction() {
+        let room_id = room_id!("!room:localhost");
+        let root = event_id!("$root");
+        let original_id = event_id!("$original");
+        let edit_id = event_id!("$edit");
+        let sender = user_id!("@alice:localhost");
+        let f = EventFactory::new().room(room_id).sender(sender);
+        let original =
+            f.text_msg("original")
+                .event_id(original_id)
+                .with_bundled_edit(f.text_msg("* edited").event_id(edit_id).edit(
+                    original_id,
+                    RoomMessageEventContentWithoutRelation::text_plain("edited"),
+                ))
+                .into_event();
+        let lock =
+            EventCacheStoreLock::new(MemoryStore::new(), CrossProcessLockConfig::SingleProcess);
+        let store = match lock.lock().await.unwrap() {
+            MappedCrossProcessLockState::Clean(store)
+            | MappedCrossProcessLockState::Dirty(store) => store,
+        };
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let chunk = ChunkIdentifier::new(0);
+        send_updates_to_store(
+            &store,
+            LinkedChunkId::Thread(room_id, root).to_owned(),
+            &sender,
+            vec![
+                Update::NewItemsChunk { previous: None, new: chunk, next: None },
+                Update::PushItems { at: Position::new(chunk, 0), items: vec![original.clone()] },
+            ],
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            send_updates_to_store(
+                &store,
+                LinkedChunkId::Thread(room_id, root).to_owned(),
+                &sender,
+                vec![Update::ReplaceItem { at: Position::new(chunk, 0), item: original.clone() }],
+            )
+            .await
+            .unwrap();
+        }
+        let related = store.find_event_relations(room_id, original_id, None).await.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].0.event_id(), Some(edit_id));
+        assert!(related[0].1.is_none());
+        assert!(
+            store.find_event(room_id, original_id).await.unwrap().unwrap().bundled_edit().is_none()
+        );
+
+        let redacted = f
+            .redacted(user_id!("@redacter:localhost"), RedactedRoomMessageEventContent::new())
+            .event_id(edit_id)
+            .into_event();
+        store.save_event(room_id, redacted.clone()).await.unwrap();
+        send_updates_to_store(
+            &store,
+            LinkedChunkId::Thread(room_id, root).to_owned(),
+            &sender,
+            vec![Update::ReplaceItem { at: Position::new(chunk, 0), item: original }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.find_event(room_id, edit_id).await.unwrap().unwrap().raw().json().get(),
+            redacted.raw().json().get(),
+        );
+    }
 }

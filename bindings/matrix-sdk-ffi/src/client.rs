@@ -1820,6 +1820,28 @@ impl Client {
         crate::thread_inbox::load(&self.inner, room_ids).await
     }
 
+    /// Create a cursor for user-driven account pages of twenty threads,
+    /// optionally only those the user participated in (filtered by the server).
+    pub fn thread_inbox_pager(
+        &self,
+        participated_only: bool,
+    ) -> Arc<crate::thread_inbox::ThreadInboxPager> {
+        crate::thread_inbox::ThreadInboxPager::new((*self.inner).clone(), participated_only)
+    }
+
+    /// Count a thread's unread replies back to the newest of `receipt_ids` or
+    /// own reply, scanning at most `max_events` replies. Builds no timeline.
+    pub async fn thread_inbox_unread(
+        &self,
+        room_id: String,
+        thread_id: String,
+        receipt_ids: Vec<String>,
+        max_events: u32,
+    ) -> Result<crate::thread_inbox::ThreadInboxUnread, ClientError> {
+        crate::thread_inbox::thread_unread(&self.inner, room_id, thread_id, receipt_ids, max_events)
+            .await
+    }
+
     /// Deliver thread-list pages incrementally. The future completes only after
     /// all selected rooms and pages have been scanned successfully.
     pub async fn load_thread_inbox_pages(

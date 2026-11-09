@@ -1,0 +1,1 @@
+Restore edits when loading cached thread replies, and select the latest valid edit deterministically when replacements arrive outside the timeline. Preserve timeline ordering for positioned edits and prioritize pending local edits.
