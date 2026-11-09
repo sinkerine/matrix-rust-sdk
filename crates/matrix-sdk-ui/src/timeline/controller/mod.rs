@@ -1653,23 +1653,12 @@ impl TimelineController {
         let (events, subscriber) = event_cache.subscribe().await?;
         let has_events = !events.is_empty();
 
-        // For each event, we also need to find the related events, as they
-        // don't include the thread relationship, they won't be included in the
-        // initial list of events.
-        //
-        // The lookups are independent store queries, so run them together
-        // rather than awaiting them one after the other. `try_join_all` keeps
-        // the input order, so the related events are collected in the same
-        // order as before.
-        let lookups = events
-            .iter()
-            .filter_map(|event| event.event_id())
-            .map(|event_id| event_cache.find_event_with_relations(event_id, None));
-
-        let mut related_events = Vector::new();
-        for (_original, related) in try_join_all(lookups).await?.into_iter().flatten() {
-            related_events.extend(related);
-        }
+        let related_events = self
+            .thread_cached_event_relations(
+                event_cache,
+                events.iter().filter_map(|event| event.event_id()),
+            )
+            .await?;
 
         self.replace_with_initial_remote_events(events, RemoteEventOrigin::Cache).await;
 
@@ -1683,6 +1672,29 @@ impl TimelineController {
         }
 
         Ok((has_events, subscriber))
+    }
+
+    pub(super) async fn thread_cached_event_relations(
+        &self,
+        event_cache: &ThreadEventCache,
+        event_ids: impl Iterator<Item = &EventId>,
+    ) -> Result<Vector<TimelineEvent>, Error> {
+        let mut seen = BTreeSet::new();
+        let event_ids = event_ids
+            .filter(|id| seen.insert((*id).to_owned()))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let lookups =
+            event_ids.iter().map(|event_id| event_cache.find_event_with_relations(event_id, None));
+        let mut related_events = Vector::new();
+        for (_original, related) in try_join_all(lookups).await?.into_iter().flatten() {
+            related_events.extend(
+                related
+                    .into_iter()
+                    .filter(|event| event.event_id().is_some_and(|id| seen.insert(id.to_owned()))),
+            );
+        }
+        Ok(related_events)
     }
 
     /// Given an event identifier, will fetch the details for the event it's

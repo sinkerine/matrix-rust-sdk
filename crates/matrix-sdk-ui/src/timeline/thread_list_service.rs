@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use eyeball::{ObservableWriteGuard, SharedObservable, Subscriber};
 use eyeball_im::{ObservableVector, VectorDiff, VectorSubscriberBatchedStream};
@@ -266,7 +268,8 @@ impl ThreadListService {
 
         let mut pagination_token = self.token.lock().await;
 
-        // Build the options for this page, using the current token if we have one.
+        // Build the options for this page, using the current token if we have
+        // one.
         let from = match &*pagination_token {
             PaginationToken::HasMore(token) => Some(token.clone()),
             _ => None,
@@ -276,7 +279,8 @@ impl ThreadListService {
 
         match self.load_thread_list(opts).await {
             Ok(thread_list) => {
-                // Update the pagination token based on whether there are more pages.
+                // Update the pagination token based on whether there are more
+                // pages.
                 *pagination_token = match &thread_list.prev_batch_token {
                     Some(token) => PaginationToken::HasMore(token.clone()),
                     None => PaginationToken::HitEnd,
@@ -284,7 +288,8 @@ impl ThreadListService {
 
                 let end_reached = thread_list.prev_batch_token.is_none();
 
-                // Merge the page without duplicating roots or replacing newer live state.
+                // Merge the page without duplicating roots or replacing newer
+                // live state.
                 let mut items = self.items.lock();
                 for mut page_item in thread_list.items {
                     if let Some(index) = items
@@ -384,7 +389,11 @@ impl ThreadListService {
         // A bundled reply is newer than its root. The generic bundled-event
         // timestamp is capped at the root timestamp, so use the reply's own
         // timestamp here (still clamped to now for malicious future values).
-        let timestamp = timeline_event.raw().get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts").ok().flatten()
+        let timestamp = timeline_event
+            .raw()
+            .get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts")
+            .ok()
+            .flatten()
             .map(|timestamp| timestamp.min(MilliSecondsSinceUnixEpoch::now()))
             .or_else(|| timeline_event.timestamp())?;
         let sender = timeline_event.sender()?;
@@ -525,11 +534,10 @@ impl ThreadListService {
                             else {
                                 continue;
                             };
-                            if refreshed_item
-                                .latest_event
-                                .as_ref()
-                                .is_none_or(|current| current.event_id != latest_event.event_id && latest_event.timestamp > current.timestamp)
-                            {
+                            if refreshed_item.latest_event.as_ref().is_none_or(|current| {
+                                current.event_id != latest_event.event_id
+                                    && latest_event.timestamp > current.timestamp
+                            }) {
                                 refreshed_item.latest_event = Some(latest_event.clone());
                                 refreshed_item.num_replies =
                                     refreshed_item.num_replies.saturating_add(*count);

@@ -17,6 +17,8 @@
 use std::collections::BTreeSet;
 
 use eyeball::Subscriber as EyeballSubscriber;
+use eyeball_im::VectorDiff;
+use imbl::Vector;
 use matrix_sdk::{
     event_cache::{
         EventFocusThreadMode, EventFocusedCache, EventsOrigin, PinnedEventsCache, RoomEventCache,
@@ -182,7 +184,46 @@ pub(in crate::timeline) async fn thread_updates_task(
 
                 let has_diffs = !diffs.is_empty();
 
+                let related_events = if matches!(origin, RemoteEventOrigin::Cache) {
+                    let mut event_ids = Vec::new();
+                    for diff in &diffs {
+                        match diff {
+                            VectorDiff::Append { values } => {
+                                event_ids
+                                    .extend(values.iter().filter_map(|event| event.event_id()));
+                            }
+                            VectorDiff::PushFront { value }
+                            | VectorDiff::PushBack { value }
+                            | VectorDiff::Insert { value, .. }
+                            | VectorDiff::Set { value, .. } => {
+                                event_ids.extend(value.event_id());
+                            }
+                            _ => {}
+                        }
+                    }
+                    match timeline_controller
+                        .thread_cached_event_relations(&event_cache, event_ids.into_iter())
+                        .await
+                    {
+                        Ok(events) => events,
+                        Err(err) => {
+                            error!(?err, "Failed to restore cached thread relations");
+                            Vector::new()
+                        }
+                    }
+                } else {
+                    Vector::new()
+                };
+
                 timeline_controller.handle_remote_events_with_diffs(diffs, origin).await;
+                if !related_events.is_empty() {
+                    timeline_controller
+                        .handle_remote_aggregations(
+                            vec![VectorDiff::Append { values: related_events }],
+                            origin,
+                        )
+                        .await;
+                }
 
                 if has_diffs && matches!(origin, RemoteEventOrigin::Cache) {
                     timeline_controller.retry_event_decryption(None).await;

@@ -1018,64 +1018,59 @@ fn resolve_edits(
     // can't validate it as we don't have a raw JSON, but this isn't that
     // important as we're sure we won't send ourselves invalid edits.
     let mut best_edit: Option<(PendingEdit, bool)> = None;
-    let mut best_edit_pos = None;
+    let mut best_positioned = None;
+    let mut best_unpositioned = None;
 
     for a in aggregations {
         if let AggregationKind::Edit(pending_edit) = &a.kind {
             // One of our own edits is always the most recent, even once sent
             // but not echoed yet.
-            if a.send_state.is_some() {
+            if a.send_state.is_some() || matches!(a.own_id, TimelineEventItemId::TransactionId(_)) {
                 best_edit = Some((pending_edit.clone(), true));
                 break;
             }
 
-            match &a.own_id {
-                TimelineEventItemId::TransactionId(_) => {
-                    // A local echo is always the most recent edit: use this
-                    // one.
-                    best_edit = Some((pending_edit.clone(), true));
-                    break;
+            // Reject invalid replacements before choosing either group winner,
+            // so they cannot hide a valid edit in the same group.
+            if !is_valid_remote_edit(event, pending_edit) {
+                continue;
+            }
+
+            let TimelineEventItemId::EventId(event_id) = &a.own_id else {
+                unreachable!("local edits were handled above");
+            };
+            let timestamp = pending_edit.edit_json.as_ref().and_then(|json| {
+                json.get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts").ok().flatten()
+            });
+            let key = (timestamp, event_id);
+            trace!(?event_id, ?timestamp, bundled_item_owner = ?pending_edit.bundled_item_owner, "resolving remote edit");
+
+            // Only the edit's own position establishes its timeline order. A
+            // bundled item's owner locates the original, not the replacement.
+            if let Some(pos) = items.position_by_event_id(event_id) {
+                if best_positioned.as_ref().is_none_or(|(best_pos, _, _)| pos > *best_pos) {
+                    best_positioned = Some((pos, key, pending_edit));
                 }
-
-                TimelineEventItemId::EventId(event_id) => {
-                    if let Some(best_edit_pos) = &mut best_edit_pos {
-                        // Find the position of the timeline owning the edit:
-                        // either the bundled item owner if this was a bundled
-                        // edit, or the edit event itself.
-                        let pos = items.position_by_event_id(
-                            pending_edit.bundled_item_owner.as_ref().unwrap_or(event_id),
-                        );
-
-                        if let Some(pos) = pos {
-                            // If the edit is more recent (higher index) than
-                            // the previous best edit we knew about, use this
-                            // one.
-                            if pos > *best_edit_pos {
-                                best_edit = Some((pending_edit.clone(), false));
-                                *best_edit_pos = pos;
-                                trace!(?best_edit_pos, edit_id = ?a.own_id, "found better edit");
-                            }
-                        } else {
-                            trace!(edit_id = ?a.own_id, "couldn't find timeline meta for edit event");
-
-                            // The edit event isn't in the timeline, so it might
-                            // be a bundled edit. In this case, record it as the
-                            // best edit if and only if there wasn't any other.
-                            if best_edit.is_none() {
-                                best_edit = Some((pending_edit.clone(), false));
-                                trace!(?best_edit_pos, edit_id = ?a.own_id, "found bundled edit");
-                            }
-                        }
-                    } else {
-                        // There wasn't any best edit yet, so record this one as
-                        // being it, with its position.
-                        best_edit = Some((pending_edit.clone(), false));
-                        best_edit_pos = items.position_by_event_id(event_id);
-                        trace!(?best_edit_pos, edit_id = ?a.own_id, "first best edit");
-                    }
-                }
+            } else if best_unpositioned.as_ref().is_none_or(|(best_key, _)| key > *best_key) {
+                best_unpositioned = Some((key, pending_edit));
             }
         }
+    }
+
+    if best_edit.is_none() {
+        // First resolve the positioned edits by timeline order, which remains
+        // authoritative even with server clock skew. Compare that winner with
+        // the latest positionless edit by server timestamp, breaking ties by
+        // event ID. Selecting the two groups separately avoids a non-transitive
+        // pairwise comparison when positions and timestamps disagree.
+        let remote_edit = match (best_positioned, best_unpositioned) {
+            (Some((_, positioned_key, positioned)), Some((unpositioned_key, unpositioned))) => {
+                Some(if unpositioned_key > positioned_key { unpositioned } else { positioned })
+            }
+            (Some((_, _, edit)), None) | (None, Some((_, edit))) => Some(edit),
+            (None, None) => None,
+        };
+        best_edit = remote_edit.map(|edit| (edit.clone(), false));
     }
 
     if let Some((edit, is_local_echo)) = best_edit {
@@ -1096,8 +1091,38 @@ fn resolve_edits(
     }
 }
 
+/// Validate a remote replacement before considering it for edit selection.
+/// Local edits have no raw JSON and are validated before sending instead.
+fn is_valid_remote_edit(item: &EventTimelineItem, edit: &PendingEdit) -> bool {
+    let Some(original_json) = item.original_json() else {
+        error!("The original event does not have the JSON field set.");
+        return false;
+    };
+
+    let Some(edit_json) = &edit.edit_json else {
+        error!(
+            "The replacement event of a remotely received edit does not have the JSON field set."
+        );
+        return false;
+    };
+
+    match check_validity_of_replacement_events(
+        original_json,
+        item.encryption_info(),
+        edit_json,
+        edit.encryption_info.as_deref(),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Event wasn't replaced due to the replacement event being invalid: {e}");
+            false
+        }
+    }
+}
+
 /// Apply the selected edit to the given EventTimelineItem.
 ///
+/// Remote edits must have passed `is_valid_remote_edit` before selection.
 /// Returns true if the edit was applied, false otherwise (because the edit and
 /// original timeline item types didn't match, for instance).
 fn edit_item(
@@ -1105,41 +1130,6 @@ fn edit_item(
     edit: PendingEdit,
     is_local_echo: bool,
 ) -> bool {
-    // We can receive edits from a local echo, i.e. the edit wasn't yet received
-    // from the homeserver.
-    //
-    // Before we send an edit we check that the event is allowed to be edited
-    // and that the replacement content is allowed.
-    //
-    // We don't have yet a full JSON of the event, so we can't do the validation
-    // here.
-    if !is_local_echo {
-        let Some(original_json) = item.original_json() else {
-            error!("The original event does not have the JSON field set.");
-            return false;
-        };
-
-        let Some(edit_json) = &edit.edit_json else {
-            error!(
-                "The replacement event of a remotely received edit does not have the JSON field set."
-            );
-            return false;
-        };
-
-        match check_validity_of_replacement_events(
-            original_json,
-            item.encryption_info(),
-            edit_json,
-            edit.encryption_info.as_deref(),
-        ) {
-            Ok(content) => content,
-            Err(e) => {
-                warn!("Event wasn't replaced due to the replacement event being invalid: {e}");
-                return false;
-            }
-        }
-    }
-
     let TimelineItemContent::MsgLike(content) = item.content() else {
         info!("Edit of message event applies to {:?}, discarding", item.content().debug_string());
         return false;

@@ -52,6 +52,7 @@ use stream_assert::assert_pending;
 mod decryption;
 mod echo;
 mod edit;
+mod edit_ordering;
 mod focus_event;
 mod location;
 mod media;

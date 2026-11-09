@@ -61,6 +61,7 @@ use crate::unable_to_decrypt_hook::UtdHookManager;
 mod basic;
 mod echo;
 mod edit;
+mod edit_ordering;
 mod encryption;
 mod event_filter;
 mod invalid;

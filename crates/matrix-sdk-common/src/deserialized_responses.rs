@@ -638,19 +638,20 @@ impl TimelineEvent {
         }
     }
 
-    /// Try to create a new [`TimelineEvent`] for the bundled latest thread
-    /// event, if we have enough information about the encryption status for it.
-    fn from_bundled_latest_event(
+    /// Try to create a new [`TimelineEvent`] for a bundled event, preserving
+    /// the encryption status recorded at its location.
+    fn from_bundled_event(
         kind: &TimelineEventKind,
         latest_event: Raw<AnySyncMessageLikeEvent>,
+        location: UnsignedEventLocation,
         max_timestamp: MilliSecondsSinceUnixEpoch,
     ) -> Option<Self> {
         match kind {
             TimelineEventKind::Decrypted(decrypted) => {
-                if let Some(unsigned_decryption_result) =
-                    decrypted.unsigned_encryption_info.as_ref().and_then(|unsigned_map| {
-                        unsigned_map.get(&UnsignedEventLocation::RelationsThreadLatestEvent)
-                    })
+                if let Some(unsigned_decryption_result) = decrypted
+                    .unsigned_encryption_info
+                    .as_ref()
+                    .and_then(|unsigned_map| unsigned_map.get(&location))
                 {
                     match unsigned_decryption_result {
                         UnsignedDecryptionResult::Decrypted(encryption_info) => {
@@ -662,10 +663,8 @@ impl TimelineEvent {
                                     // a room_id in its payload.
                                     event: latest_event.cast_unchecked(),
                                     encryption_info: encryption_info.clone(),
-                                    // A bundled latest event is never a thread
-                                    // root. It could have a replacement event,
-                                    // but we don't carry this information
-                                    // around.
+                                    // Nested bundles have no decryption
+                                    // metadata in the unsigned map.
                                     unsigned_encryption_info: None,
                                 },
                                 None,
@@ -694,16 +693,12 @@ impl TimelineEvent {
         match latest_event.get_field::<MessageLikeEventType>("type") {
             Ok(None) => {
                 let event_id = latest_event.get_field::<OwnedEventId>("event_id").ok().flatten();
-                warn!(
-                    ?event_id,
-                    "couldn't deserialize bundled latest thread event: missing `type` field \
-                     in bundled latest thread event"
-                );
+                warn!(?event_id, "couldn't deserialize bundled event: missing `type` field");
                 None
             }
 
             Ok(Some(MessageLikeEventType::RoomEncrypted)) => {
-                // The bundled latest thread event is encrypted, but we didn't
+                // The bundled event is encrypted, but we didn't
                 // have any information about it in the unsigned map. Try to
                 // fetch the information from the content instead.
                 let session_id = if let Some(content) =
@@ -731,10 +726,23 @@ impl TimelineEvent {
 
             Err(err) => {
                 let event_id = latest_event.get_field::<OwnedEventId>("event_id").ok().flatten();
-                warn!(?event_id, "couldn't deserialize bundled latest thread event's type: {err}");
+                warn!(?event_id, "couldn't deserialize bundled event's type: {err}");
                 None
             }
         }
+    }
+
+    /// Extract the bundled replacement with its own decryption metadata.
+    pub fn bundled_edit(&self) -> Option<Self> {
+        let unsigned: Raw<serde_json::Value> = self.raw().get_field("unsigned").ok()??;
+        let relations: Raw<serde_json::Value> = unsigned.get_field("m.relations").ok()??;
+        let replacement = relations.get_field("m.replace").ok()??;
+        Self::from_bundled_event(
+            &self.kind,
+            replacement,
+            UnsignedEventLocation::RelationsReplace,
+            MilliSecondsSinceUnixEpoch::now(),
+        )
     }
 
     /// Read the current push actions.
@@ -849,9 +857,10 @@ impl TimelineEvent {
     pub fn bundled_latest_thread_event(&self) -> Option<Self> {
         let bundled_thread = extract_bundled_thread(self.raw())?;
 
-        Self::from_bundled_latest_event(
+        Self::from_bundled_event(
             &self.kind,
             bundled_thread.latest_event,
+            UnsignedEventLocation::RelationsThreadLatestEvent,
             self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
         )
     }
@@ -875,9 +884,10 @@ impl TimelineEvent {
                         .flatten(),
                     bundled_thread.count,
                 ),
-                Self::from_bundled_latest_event(
+                Self::from_bundled_event(
                     &self.kind,
                     bundled_thread.latest_event,
+                    UnsignedEventLocation::RelationsThreadLatestEvent,
                     self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
                 )?,
             ))
@@ -1548,6 +1558,82 @@ mod tests {
     }
 
     #[test]
+    fn bundled_edit_preserves_decryption_metadata() {
+        let encryption_info = Arc::new(EncryptionInfo {
+            sender: owned_user_id!("@sender:example.com"),
+            sender_device: None,
+            forwarder: None,
+            algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key: "xxx".to_owned(),
+                sender_claimed_keys: Default::default(),
+                session_id: Some("edit-session".to_owned()),
+            },
+            verification_state: VerificationState::Verified,
+        });
+        let mut parent_encryption_info = (*encryption_info).clone();
+        parent_encryption_info.sender_device = Some(owned_device_id!("PARENT"));
+        let utd_info = UnableToDecryptInfo {
+            session_id: Some("edit-session".to_owned()),
+            reason: UnableToDecryptReason::MalformedEncryptedEvent,
+        };
+        for result in [
+            UnsignedDecryptionResult::Decrypted(encryption_info),
+            UnsignedDecryptionResult::UnableToDecrypt(utd_info),
+        ] {
+            let mut raw = example_event();
+            raw["unsigned"] = json!({"m.relations": {"m.replace": example_event()}});
+            let original = TimelineEvent::from_decrypted(
+                DecryptedRoomEvent {
+                    event: Raw::new(&raw).unwrap().cast_unchecked(),
+                    encryption_info: Arc::new(parent_encryption_info.clone()),
+                    unsigned_encryption_info: Some(BTreeMap::from([(
+                        UnsignedEventLocation::RelationsReplace,
+                        result.clone(),
+                    )])),
+                },
+                None,
+            );
+            let edit = original.bundled_edit().unwrap();
+            assert_eq!(edit.event_id(), Some(event_id!("$xxxxx:example.org")));
+            match result {
+                UnsignedDecryptionResult::Decrypted(info) => {
+                    let TimelineEventKind::Decrypted(decrypted) = edit.kind else { panic!() };
+                    assert!(Arc::ptr_eq(&decrypted.encryption_info, &info));
+                    assert!(decrypted.unsigned_encryption_info.is_none());
+                }
+                UnsignedDecryptionResult::UnableToDecrypt(info) => {
+                    let TimelineEventKind::UnableToDecrypt { utd_info, .. } = edit.kind else {
+                        panic!()
+                    };
+                    assert_eq!(
+                        serde_json::to_value(utd_info).unwrap(),
+                        serde_json::to_value(info).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_edit_without_decryption_metadata() {
+        let mut raw = example_event();
+        raw["unsigned"] = json!({"m.relations": {"m.replace": example_event()}});
+        let original = TimelineEvent::from_plaintext(Raw::new(&raw).unwrap().cast_unchecked());
+        assert_matches!(original.bundled_edit().unwrap().kind, TimelineEventKind::PlainText { .. });
+        raw["unsigned"]["m.relations"]["m.replace"]["type"] = json!("m.room.encrypted");
+        let original = TimelineEvent::from_plaintext(Raw::new(&raw).unwrap().cast_unchecked());
+        assert_matches!(
+            original.bundled_edit().unwrap().kind,
+            TimelineEventKind::UnableToDecrypt { .. }
+        );
+        assert!(
+            TimelineEvent::from_plaintext(Raw::new(&example_event()).unwrap().cast_unchecked())
+                .bundled_edit()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn sync_timeline_debug_content() {
         let room_event =
             TimelineEvent::from_plaintext(Raw::new(&example_event()).unwrap().cast_unchecked());
@@ -2123,9 +2209,10 @@ mod tests {
                 reason: UnableToDecryptReason::Unknown,
             },
         };
-        let result = TimelineEvent::from_bundled_latest_event(
+        let result = TimelineEvent::from_bundled_event(
             &kind,
             value.cast_unchecked(),
+            UnsignedEventLocation::RelationsThreadLatestEvent,
             MilliSecondsSinceUnixEpoch::now(),
         )
         .expect("Could not get bundled latest event");
