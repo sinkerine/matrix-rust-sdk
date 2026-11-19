@@ -1307,11 +1307,7 @@ impl RoomSendQueue {
                         MediaSource::Plain(res.content_uri)
                     };
 
-                    let uri = match &media_source {
-                        MediaSource::Plain(uri) => uri,
-                        MediaSource::Encrypted(encrypted_file) => &encrypted_file.url,
-                    };
-                    trace!(%relates_to, mxc_uri = %uri, "media successfully uploaded");
+                    trace!(%relates_to, "media successfully uploaded");
 
                     Ok((
                         Some(SentRequestKey::Media(SentMediaInfo {

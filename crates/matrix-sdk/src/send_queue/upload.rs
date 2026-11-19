@@ -295,7 +295,7 @@ impl RoomSendQueue {
         let send_event_txn = config.txn_id.map_or_else(ChildTransactionId::new, Into::into);
 
         Span::current().record("event_txn", tracing::field::display(&*send_event_txn));
-        debug!(filename, %content_type, %upload_file_txn, "sending an attachment");
+        debug!(%content_type, %upload_file_txn, "sending an attachment");
 
         let file_media_request = Media::make_local_file_media_request(&upload_file_txn);
 
@@ -427,7 +427,7 @@ impl RoomSendQueue {
 
             let upload_file_txn = TransactionId::new();
 
-            debug!(filename, %content_type, %upload_file_txn, "uploading a gallery attachment");
+            debug!(%content_type, %upload_file_txn, "uploading a gallery attachment");
 
             let file_media_request = Media::make_local_file_media_request(&upload_file_txn);
 
@@ -1248,7 +1248,7 @@ async fn update_media_cache_keys_after_upload(
     // Do it for the file itself.
     let from_req = Media::make_local_file_media_request(file_upload_txn);
 
-    trace!(from = ?from_req.source, to = ?sent_media.file, "renaming media file key in cache store");
+    trace!("renaming media file key in cache store");
     let media_store =
         client.media_store().lock().await.map_err(RoomSendQueueStorageError::LockError)?;
 
@@ -1274,8 +1274,6 @@ async fn update_media_cache_keys_after_upload(
 
         if let Some((height, width)) = info.height.zip(info.width) {
             trace!(
-                from = ?from_req.source,
-                to = ?remote_thumbnail_source,
                 height = u64::from(height),
                 width = u64::from(width),
                 "storing thumbnail as a thumbnail for the uploaded media, and a file in itself, in cache store"
@@ -1312,23 +1310,17 @@ async fn update_media_cache_keys_after_upload(
                 }
 
                 Ok(None) => {
-                    warn!(
-                        from = ?from_request_params.source,
-                        "unable to reload thumbnail content from media store: no content found",
-                    );
+                    warn!("unable to reload thumbnail content from media store: no content found",);
                 }
 
                 Err(err) => {
                     // Silently log the error, but proceed, as storing the
                     // thumbnail as such isn't a strong requirement.
-                    error!(
-                        from = ?from_request_params.source,
-                        "unable to reload thumbnail content from media store: {err}"
-                    );
+                    error!("unable to reload thumbnail content from media store: {err}");
                 }
             }
         } else {
-            trace!(from = ?from_req.source, to = ?remote_thumbnail_source, "only renaming thumbnail key to file in cache store");
+            trace!("only renaming thumbnail key to file in cache store");
         }
 
         // The thumbnail file can now be removed during cleanups.
