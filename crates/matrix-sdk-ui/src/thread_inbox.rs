@@ -534,7 +534,7 @@ mod tests {
         let events = (0..25)
             .map(|i| {
                 f.text_msg("root")
-                    .event_id(&ruma::EventId::parse(format!("$root{i}")).unwrap())
+                    .event_id(ruma::EventId::parse(format!("$root{i}")).unwrap())
                     .into_raw()
             })
             .collect();
@@ -804,7 +804,7 @@ mod tests {
                     };
                     let mut msg = factory
                         .text_msg("reply")
-                        .event_id(&ruma::EventId::parse(format!("${id}")).unwrap());
+                        .event_id(ruma::EventId::parse(format!("${id}")).unwrap());
                     if mention {
                         msg = msg.mentions(ruma::events::Mentions::with_user_ids([user_id!(
                             "@example:localhost"

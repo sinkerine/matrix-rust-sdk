@@ -480,7 +480,10 @@ mod tests {
             MappedCrossProcessLockState::Clean(store)
             | MappedCrossProcessLockState::Dirty(store) => store,
         };
-        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let sender = LinkedChunkUpdateSender::new(
+            #[cfg(feature = "experimental-search")]
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
         let chunk = ChunkIdentifier::new(0);
         send_updates_to_store(
             &store,
