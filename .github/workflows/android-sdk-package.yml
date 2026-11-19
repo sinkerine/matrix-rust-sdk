@@ -2,13 +2,29 @@ name: Publish custom Android Rust SDK
 
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full tested main commit SHA
+        required: true
+        type: string
+      version:
+        description: Unused Maven version (26.09.9-custom.N)
+        required: true
+        type: string
+      publish:
+        description: Publish the verified AAR to GitHub Packages
+        default: false
+        type: boolean
 
 permissions: {}
 
 jobs:
   publish:
-    if: github.ref == 'refs/heads/custom'
+    if: github.ref == 'refs/heads/main' && github.repository == 'sinkerine/matrix-rust-sdk'
     runs-on: ubuntu-24.04
+    concurrency:
+      group: android-sdk-maven-publication
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -17,6 +33,14 @@ jobs:
       NDK_VERSION: 29.0.14206865
 
     steps:
+      - name: Verify exact source and version inputs
+        env:
+          TESTED_SHA: ${{ inputs.source_sha }}
+          SDK_VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ && "$TESTED_SHA" == "$GITHUB_SHA" ]]
+          [[ "$SDK_VERSION" =~ ^26\.09\.9-custom\.[1-9][0-9]*$ ]]
+
       - name: Checkout Rust SDK source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,41 +82,80 @@ jobs:
       - name: Install pinned cargo-ndk
         run: cargo install cargo-ndk --version 3.5.4 --locked
 
-      - name: Set custom immutable Maven version
+      - name: Set immutable Maven version
         working-directory: matrix-rust-components-kotlin
-        run: sed -i 's/patchVersion = "9"/patchVersion = "9-custom.1"/' buildSrc/src/main/kotlin/BuildVersionsSDK.kt
+        env:
+          SDK_VERSION: ${{ inputs.version }}
+        run: |
+          file=buildSrc/src/main/kotlin/BuildVersionsSDK.kt
+          grep -F 'patchVersion = "9"' "$file"
+          sed -i "s/patchVersion = \"9\"/patchVersion = \"${SDK_VERSION#26.09.}\"/" "$file"
+
+      - name: Build and test release AAR for all Android ABIs
+        working-directory: matrix-rust-components-kotlin
+        run: |
+          ./scripts/build.sh -r -p "$GITHUB_WORKSPACE"
+          ./gradlew --no-daemon :sdk:sdk-android:testReleaseUnitTest
+          aar=sdk/sdk-android/build/outputs/aar/sdk-android-release.aar
+          test_dir=$(mktemp -d)
+          unzip -tq "$aar"
+          unzip -q "$aar" 'jni/*/libmatrix_sdk_ffi.so' classes.jar -d "$test_dir"
+          python3 - "$test_dir" <<'PY'
+          import pathlib
+          import sys
+
+          expected = {"arm64-v8a": 183, "armeabi-v7a": 40, "x86": 3, "x86_64": 62}
+          for abi, machine in expected.items():
+              library = pathlib.Path(sys.argv[1], "jni", abi, "libmatrix_sdk_ffi.so")
+              with library.open("rb") as elf:
+                  header = elf.read(20)
+              if header[:4] != b"\x7fELF" or header[5:6] != b"\x01" or int.from_bytes(header[18:20], "little") != machine:
+                  sys.exit(f"Unexpected ELF header for {abi}")
+          PY
+          jars="$test_dir/classes.txt"
+          jar tf "$test_dir/classes.jar" > "$jars"
+          grep -Fx 'org/matrix/rustcomponents/sdk/ThreadInboxPager.class' "$jars"
+          grep -Fx 'org/matrix/rustcomponents/sdk/ThreadInboxUnread.class' "$jars"
+          javap -classpath "$test_dir/classes.jar" org.matrix.rustcomponents.sdk.Timeline > "$test_dir/timeline.txt"
+          grep 'sendReplyWithExtraContent(' "$test_dir/timeline.txt"
+          cp "$aar" "$RUNNER_TEMP/sdk-android-release.aar"
+          cd "$RUNNER_TEMP"
+          sha256sum sdk-android-release.aar > sdk-android-release.aar.sha256
+          printf '%s\n' "$GITHUB_SHA" > sdk-android-source.sha
+
+      - name: Save verified release AAR and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdk-android-${{ inputs.version }}
+          path: |
+            ${{ runner.temp }}/sdk-android-release.aar
+            ${{ runner.temp }}/sdk-android-release.aar.sha256
+            ${{ runner.temp }}/sdk-android-source.sha
+          if-no-files-found: error
 
       - name: Refuse to replace an existing Maven version
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SDK_VERSION: ${{ inputs.version }}
         run: |
-          status=$(curl --silent --show-error --output "$RUNNER_TEMP/package-versions.json" \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            'https://api.github.com/users/15cm/packages/maven/org.matrix.rustcomponents%3Asdk-android/versions')
-          if [ "$status" = 200 ]; then
-            if jq -e '.[] | select(.name == "26.09.9-custom.1")' \
-              "$RUNNER_TEMP/package-versions.json" >/dev/null; then
-              echo 'Maven version 26.09.9-custom.1 already exists; refusing replacement.' >&2
-              exit 1
-            fi
-          elif [ "$status" != 404 ]; then
-            echo "Unable to verify package versions (HTTP $status); refusing publication." >&2
-            cat "$RUNNER_TEMP/package-versions.json" >&2
-            exit 1
-          fi
+          gh api --paginate --slurp \
+            'users/sinkerine/packages/maven/org.matrix.rustcomponents.sdk-android/versions' \
+            > "$RUNNER_TEMP/package-versions.json"
+          jq -e --arg version "$SDK_VERSION" \
+            'all(.[][]; .name != $version)' "$RUNNER_TEMP/package-versions.json"
+          curl --fail --silent --show-error --location --output /dev/null \
+            --user "$GITHUB_ACTOR:$GH_TOKEN" \
+            'https://maven.pkg.github.com/sinkerine/matrix-rust-sdk/org/matrix/rustcomponents/sdk-android/26.09.9-custom.1/sdk-android-26.09.9-custom.1.pom'
+          [[ "$(git ls-remote origin refs/heads/main | cut -f1)" == "$GITHUB_SHA" ]]
 
-      - name: Build release AAR for all Android ABIs
-        working-directory: matrix-rust-components-kotlin
-        run: ./scripts/build.sh -r -p "$GITHUB_WORKSPACE" -o "$RUNNER_TEMP/sdk-android-release.aar"
-
-      - name: Publish Maven package to this fork
+      - name: Publish the verified Maven package to this fork
+        if: inputs.publish
         working-directory: matrix-rust-components-kotlin
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SDK_VERSION: ${{ inputs.version }}
         run: |
           cat > "$RUNNER_TEMP/github-packages.init.gradle" <<'EOF'
           gradle.projectsEvaluated {
@@ -100,7 +163,7 @@ jobs:
               if (sdk != null) {
                   sdk.publishing.repositories.maven {
                       name = 'GitHubPackages'
-                      url = uri('https://maven.pkg.github.com/15cm/matrix-rust-sdk')
+                      url = uri('https://maven.pkg.github.com/sinkerine/matrix-rust-sdk')
                       credentials {
                           username = System.getenv('GITHUB_ACTOR')
                           password = System.getenv('GITHUB_TOKEN')
@@ -109,15 +172,35 @@ jobs:
                   sdk.tasks.withType(org.gradle.plugins.signing.Sign).configureEach {
                       enabled = false
                   }
+                  sdk.tasks.withType(org.gradle.api.publish.maven.tasks.PublishToMavenRepository).configureEach {
+                      doFirst {
+                          def aar = publication.artifacts.find { it.extension == 'aar' && !it.classifier }
+                          def verified = new File(System.getenv('RUNNER_TEMP'), 'sdk-android-release.aar')
+                          if (publication.groupId != 'org.matrix.rustcomponents' ||
+                              publication.artifactId != 'sdk-android' ||
+                              publication.version != System.getenv('SDK_VERSION') ||
+                              aar == null || java.nio.file.Files.mismatch(aar.file.toPath(), verified.toPath()) != -1) {
+                              throw new GradleException('Maven publication differs from the verified SDK artifact')
+                          }
+                      }
+                  }
               }
           }
           EOF
           ./gradlew --no-daemon --stacktrace -I "$RUNNER_TEMP/github-packages.init.gradle" \
             :sdk:sdk-android:publishReleasePublicationToGitHubPackagesRepository
 
-      - name: Save release AAR
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: sdk-android-26.09.9-custom.1
-          path: ${{ runner.temp }}/sdk-android-release.aar
-          if-no-files-found: error
+      - name: Verify published Maven bytes
+        if: inputs.publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SDK_VERSION: ${{ inputs.version }}
+        run: |
+          curl --fail --silent --show-error --location --retry 4 --retry-all-errors \
+            --user "$GITHUB_ACTOR:$GITHUB_TOKEN" \
+            --output "$RUNNER_TEMP/published.aar" \
+            "https://maven.pkg.github.com/sinkerine/matrix-rust-sdk/org/matrix/rustcomponents/sdk-android/$SDK_VERSION/sdk-android-$SDK_VERSION.aar"
+          cmp "$RUNNER_TEMP/sdk-android-release.aar" "$RUNNER_TEMP/published.aar"
+          printf 'Published **org.matrix.rustcomponents:sdk-android:%s** from **%s**.\n\n' \
+            "$SDK_VERSION" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf 'AAR SHA-256 **%s**.\n' "$(sha256sum "$RUNNER_TEMP/published.aar" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
