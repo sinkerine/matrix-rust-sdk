@@ -60,6 +60,8 @@ use matrix_sdk_common::{
 };
 use mime::Mime;
 use reply::Reply;
+#[cfg(feature = "unstable-msc4536")]
+use ruma::api::FeatureFlag;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::AnySyncMessageLikeEvent;
 #[cfg(feature = "experimental-encrypted-state-events")]
@@ -358,6 +360,11 @@ macro_rules! make_media_type {
             }
 
             mime::VIDEO => {
+                #[cfg(feature = "unstable-msc4546")]
+                let circle = match &$info {
+                    Some(AttachmentInfo::Video(video_info)) => video_info.circle,
+                    _ => false,
+                };
                 let info = assign!($info.map(VideoInfo::from).unwrap_or_default(), {
                     mimetype: Some($content_type.as_ref().to_owned()),
                     thumbnail_source,
@@ -366,8 +373,10 @@ macro_rules! make_media_type {
                 let content = assign!(VideoMessageEventContent::new(body, $source), {
                     info: Some(Box::new(info)),
                     formatted,
-                    filename
+                    filename,
                 });
+                #[cfg(feature = "unstable-msc4546")]
+                let content = content.circle(circle);
                 <$t>::Video(content)
             }
 
@@ -1307,6 +1316,41 @@ impl Room {
             .into_iter()
             .map(|member| RoomMember::new(self.client.clone(), member))
             .collect())
+    }
+
+    /// Fetch the missing global profiles of this room's joined members in the
+    /// background, e.g. after loading the members with [`Room::members()`].
+    ///
+    /// This returns once the fetch is queued, without waiting for the profiles.
+    /// They are announced through
+    /// [`Client::subscribe_to_global_profile_updates()`] as they are
+    /// stored.
+    ///
+    /// This does nothing unless the room is joined, global profiles are being
+    /// synced (see [`Client::is_global_profile_sync_enabled()`]) and the
+    /// homeserver supports [MSC4536]. The first two are needed for the sync to
+    /// keep the fetched profiles up to date.
+    ///
+    /// [MSC4536]: https://github.com/matrix-org/matrix-spec-proposals/pull/4536
+    #[cfg(feature = "unstable-msc4536")]
+    pub async fn fetch_missing_global_profiles_in_background(&self) -> Result<()> {
+        if self.state() != RoomState::Joined {
+            return Ok(());
+        }
+
+        if !self.client.is_global_profile_sync_enabled().await? {
+            return Ok(());
+        }
+
+        if !self.client.unstable_features().await?.contains(&FeatureFlag::Msc4536) {
+            debug!("The homeserver doesn't support fetching multiple profiles");
+            return Ok(());
+        }
+
+        let user_ids = self.inner.joined_user_ids().await?;
+        self.client.global_profile_fetcher().enqueue(user_ids);
+
+        Ok(())
     }
 
     /// Get the user IDs of the members with the given memberships, without the
@@ -2663,7 +2707,9 @@ impl Room {
     ///
     /// If you want to set a transaction ID for the event, use
     /// [`.with_transaction_id()`][SendRawMessageLikeEvent::with_transaction_id]
-    /// on the returned value before `.await`ing it.
+    /// on the returned value before `.await`ing it. To schedule the event as a
+    /// delayed event ([MSC4140]), use
+    /// [`.into_delayed()`][SendRawMessageLikeEvent::into_delayed].
     ///
     /// # Arguments
     ///
@@ -2672,6 +2718,8 @@ impl Room {
     ///   type can be `serde_json::Value`, but also other raw JSON types; for
     ///   the full list check the documentation of
     ///   [`IntoRawMessageLikeEventContent`].
+    ///
+    /// [MSC4140]: https://github.com/matrix-org/matrix-spec-proposals/pull/4140
     ///
     /// # Examples
     ///
@@ -3354,6 +3402,10 @@ impl Room {
     ///
     /// Returns the parsed response from the server.
     ///
+    /// To schedule the event as a delayed event ([MSC4140]), use
+    /// [`.into_delayed()`][SendRawStateEvent::into_delayed] on the returned
+    /// value before `.await`ing it.
+    ///
     /// # Arguments
     ///
     /// - `event_type` - The type of the event that we're sending out.
@@ -3383,6 +3435,7 @@ impl Room {
     /// # anyhow::Ok(()) };
     /// ```
     ///
+    /// [MSC4140]: https://github.com/matrix-org/matrix-spec-proposals/pull/4140
     /// [msc4362]: https://github.com/matrix-org/matrix-spec-proposals/pull/4362
     #[instrument(skip_all)]
     pub fn send_state_event_raw<'a>(
@@ -4288,30 +4341,54 @@ impl Room {
 
     /// Compute the effective message retention policy for this room.
     ///
-    /// Fetches the server's retention configuration and applies the MSC1763
-    /// algorithm. Use [`Self::effective_retention_with_server_config`] to
-    /// supply a pre-fetched server config and avoid a network call.
+    /// Gets the server's retention configuration from the client's cache and
+    /// applies the MSC1763 algorithm. Use
+    /// [`Self::effective_retention_with_server_config`] to supply a
+    /// pre-fetched server config instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `can_refresh_global_configuration` - Whether the server's retention
+    ///   configuration can be fetched from the homeserver if the cached value
+    ///   is missing or has expired, see [`Client::retention_configuration`]. If
+    ///   this is `false`, no request is made and the cached value is used even
+    ///   if it has expired.
     ///
     /// Returns `Ok(None)` if the homeserver does not implement MSC1763. A
     /// homeserver that does not implement this endpoint also does not purge
     /// events on its own, so we don't apply retention limits locally.
     ///
+    /// Also returns `Ok(None)` if `can_refresh_global_configuration` is
+    /// `false` and the server's retention configuration was never fetched,
+    /// since we can't know whether the homeserver supports MSC1763.
+    ///
     /// See
     /// [MSC1763](https://github.com/matrix-org/matrix-spec-proposals/pull/1763)
     /// for more info.
-    pub async fn effective_retention(&self) -> Result<Option<RoomRetentionEventContent>> {
-        let config = match self.client.get_retention_configuration().await {
-            Ok(config) => config,
-            Err(e) if e.is_endpoint_not_implemented() => {
-                debug!(
-                    room_id = ?self.room_id(),
-                    "Homeserver doesn't implement the MSC1763 retention configuration \
-                     endpoint; treating this room as having no effective retention policy"
-                );
-                return Ok(None);
+    pub async fn effective_retention(
+        &self,
+        can_refresh_global_configuration: bool,
+    ) -> Result<Option<RoomRetentionEventContent>> {
+        let config = if can_refresh_global_configuration {
+            match self.client.retention_configuration().await {
+                Ok(config) => Some(config),
+                Err(e) if e.is_endpoint_not_implemented() => None,
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
+        } else {
+            self.client.inner.caches.retention_configuration.get().map(|config| config.into_data())
         };
+
+        let Some(config) = config else {
+            debug!(
+                room_id = ?self.room_id(),
+                "The MSC1763 retention configuration is not available (not supported by the \
+                 homeserver, or never fetched); treating this room as having no effective \
+                 retention policy"
+            );
+            return Ok(None);
+        };
+
         Ok(self.effective_retention_with_server_config(&config))
     }
 
@@ -4334,10 +4411,10 @@ impl Room {
     /// for more info.
     pub fn effective_retention_with_server_config(
         &self,
-        config: &get_retention_configuration::unstable::Response,
+        config: &get_retention_configuration::msc1763::Response,
     ) -> Option<RoomRetentionEventContent> {
         use ruma::api::client::retention::{
-            RoomIdOrAllRooms, get_retention_configuration::unstable::LifetimeLimits,
+            RoomIdOrAllRooms, get_retention_configuration::msc1763::LifetimeLimits,
         };
 
         fn clamp(value: Option<Duration>, limits: &Option<LifetimeLimits>) -> Option<Duration> {
@@ -4397,6 +4474,66 @@ impl Room {
             (Some(max), None) => RoomRetentionEventContent::new().at_most(max),
             (None, Some(min)) => RoomRetentionEventContent::new().at_least(min),
             (None, None) => Some(RoomRetentionEventContent::new()),
+        }
+    }
+
+    /// Subscribe to changes of the effective message retention policy for this
+    /// room.
+    ///
+    /// The returned stream first yields the current effective retention
+    /// policy, as [`Self::effective_retention`] would compute it with
+    /// `can_refresh_global_configuration` set to `false`. Then it yields a new
+    /// value whenever it changes, either because the cached server retention
+    /// configuration was updated (see
+    /// [`Client::subscribe_to_retention_configuration`]) or because the room's
+    /// `m.room.retention` state event changed.
+    ///
+    /// This never makes a request to the homeserver: use
+    /// [`Client::fetch_retention_configuration`] or
+    /// [`Client::retention_configuration`] to refresh the cached server
+    /// configuration. `None` is yielded while the server configuration was
+    /// never fetched, since we can't know whether the homeserver supports
+    /// MSC1763.
+    ///
+    /// See
+    /// [MSC1763](https://github.com/matrix-org/matrix-spec-proposals/pull/1763)
+    /// for more info.
+    pub fn subscribe_to_effective_retention(
+        &self,
+    ) -> impl Stream<Item = Option<RoomRetentionEventContent>> + use<> {
+        let room = self.clone();
+        // Subscribe before computing the initial value, so no change is missed.
+        let mut updates = futures_stream::select(
+            self.client.subscribe_to_retention_configuration().map(|_| ()),
+            self.subscribe_info().map(|_| ()),
+        );
+
+        let compute = move || {
+            room.client
+                .inner
+                .caches
+                .retention_configuration
+                .get()
+                .and_then(|config| room.effective_retention_with_server_config(config.data()))
+        };
+        // `RoomRetentionEventContent` doesn't implement `PartialEq`.
+        let key = |retention: &Option<RoomRetentionEventContent>| {
+            retention.as_ref().map(|r| (r.min_lifetime(), r.max_lifetime()))
+        };
+
+        stream! {
+            let mut current = compute();
+            yield current.clone();
+
+            // The room info changes for many reasons unrelated to retention, so
+            // only yield actual changes of the effective retention.
+            while updates.next().await.is_some() {
+                let new = compute();
+                if key(&new) != key(&current) {
+                    current = new;
+                    yield current.clone();
+                }
+            }
         }
     }
 
@@ -4478,7 +4615,7 @@ impl Room {
 
         match self
             .client
-            .send(subscribe_thread::unstable::Request::new(
+            .send(subscribe_thread::msc4306::Request::new(
                 self.room_id().to_owned(),
                 thread_root.clone(),
                 automatic,
@@ -4560,7 +4697,7 @@ impl Room {
     #[instrument(skip(self), fields(room_id = %self.room_id()))]
     pub async fn unsubscribe_thread(&self, thread_root: OwnedEventId) -> Result<()> {
         self.client
-            .send(unsubscribe_thread::unstable::Request::new(
+            .send(unsubscribe_thread::msc4306::Request::new(
                 self.room_id().to_owned(),
                 thread_root.clone(),
             ))
@@ -4607,7 +4744,7 @@ impl Room {
     ) -> Result<Option<ThreadSubscription>> {
         let result = self
             .client
-            .send(get_thread_subscription::unstable::Request::new(
+            .send(get_thread_subscription::msc4306::Request::new(
                 self.room_id().to_owned(),
                 thread_root.clone(),
             ))
@@ -4974,10 +5111,15 @@ mod tests {
 
     use matrix_sdk_base::{ComposerDraft, DraftAttachment, store::ComposerDraftType};
     use matrix_sdk_test::{
-        JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
+        JoinedRoomBuilder, SyncResponseBuilder, TestRoom, async_test, event_factory::EventFactory,
     };
     use ruma::{
-        RoomVersionId, event_id,
+        RoomVersionId,
+        api::client::retention::{
+            RoomIdOrAllRooms,
+            get_retention_configuration::msc1763::{LifetimeLimits, RetentionLimits},
+        },
+        event_id,
         events::{
             relation::RelationType,
             room::{member::MembershipState, retention::RoomRetentionEventContent},
@@ -4986,7 +5128,7 @@ mod tests {
     };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path, path_regex},
+        matchers::{header, method, path_regex},
     };
 
     use crate::{
@@ -5004,7 +5146,7 @@ mod tests {
     #[async_test]
     async fn test_cache_invalidation_while_encrypt() {
         use matrix_sdk_base::store::RoomLoadSettings;
-        use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, message_like_event_content};
+        use matrix_sdk_test::{TestRoom, message_like_event_content};
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let sqlite_path = tmp_dir.path().join("cache_invalidation_while_encrypt.db");
@@ -5044,14 +5186,14 @@ mod tests {
                         .add_state_event(
                             f.member(user_id!("@example:localhost")).display_name("example"),
                         )
-                        .add_state_event(f.default_power_levels())
+                        .add_state_event(f.power_levels())
                         .add_state_event(f.room_encryption()),
                 )
                 .build_sync_response();
             client.base_client().receive_sync_response(response).await.unwrap();
         }
 
-        let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
+        let room = client.get_room(TestRoom::Default.into()).expect("Room should exist");
 
         // Step 1, preshare the room keys.
         room.preshare_room_key().await.unwrap();
@@ -5099,15 +5241,13 @@ mod tests {
 
     #[async_test]
     async fn test_composer_draft() {
-        use matrix_sdk_test::DEFAULT_TEST_ROOM_ID;
-
         let client = logged_in_client(None).await;
 
         let response = SyncResponseBuilder::default()
             .add_joined_room(JoinedRoomBuilder::default())
             .build_sync_response();
         client.base_client().receive_sync_response(response).await.unwrap();
-        let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
+        let room = client.get_room(TestRoom::Default.into()).expect("Room should exist");
 
         assert_eq!(room.load_composer_draft(None).await.unwrap(), None);
 
@@ -5505,11 +5645,10 @@ mod tests {
         let room_id = room_id!("!a:b.c");
         let sender_id = client.user_id().expect("No session id");
         let f = EventFactory::new().room(room_id).sender(sender_id);
-        let mut user_map = BTreeMap::from([(sender_id.into(), 50.into())]);
 
         // Computing the power levels will need these 3 state events:
-        let room_create_event = f.create(sender_id, RoomVersionId::V1).state_key("").into();
-        let power_levels_event = f.power_levels(&mut user_map).state_key("").into();
+        let room_create_event = f.create(sender_id, RoomVersionId::V1).into();
+        let power_levels_event = f.power_levels().set_users([(sender_id, 50)]).into();
         let room_member_event = f.member(sender_id).into();
 
         // With only the room member event
@@ -5565,17 +5704,6 @@ mod tests {
         room_id!("!a:b.c")
     }
 
-    async fn mock_retention_config(
-        server: &MatrixMockServer,
-        body: serde_json::Value,
-    ) -> wiremock::MockGuard {
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/unstable/org.matrix.msc1763/retention/configuration"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount_as_scoped(server.server())
-            .await
-    }
-
     async fn room_with_retention(
         server: &MatrixMockServer,
         client: &Client,
@@ -5597,16 +5725,9 @@ mod tests {
         let client = server.client_builder().build().await;
         let room = server.sync_joined_room(&client, retention_room_id()).await;
 
-        let _mock = mock_retention_config(
-            &server,
-            serde_json::json!({
-                "policies": {},
-                "limits": {},
-            }),
-        )
-        .await;
+        let _mock = server.mock_get_retention_configuration().ok_empty().mount_as_scoped().await;
 
-        let result = room.effective_retention().await.unwrap();
+        let result = room.effective_retention(true).await.unwrap();
         assert!(result.is_none());
     }
 
@@ -5625,17 +5746,59 @@ mod tests {
         )
         .await;
 
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/unstable/org.matrix.msc1763/retention/configuration"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "errcode": "M_UNRECOGNIZED",
-                "error": "Unrecognized request",
-            })))
-            .mount(server.server())
-            .await;
+        server.mock_get_retention_configuration().error_unrecognized().mount().await;
 
-        let result = room.effective_retention().await.unwrap();
+        let result = room.effective_retention(true).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[async_test]
+    async fn test_effective_retention_without_refresh() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = server.sync_joined_room(&client, retention_room_id()).await;
+
+        // Nothing is cached and we can't refresh: no request is made, and there
+        // is no effective retention policy.
+        {
+            let _mock = server
+                .mock_get_retention_configuration()
+                .ok_empty()
+                .never()
+                .mount_as_scoped()
+                .await;
+
+            assert!(room.effective_retention(false).await.unwrap().is_none());
+        }
+
+        // Cache a value.
+        {
+            let _mock = server
+                .mock_get_retention_configuration()
+                .ok(
+                    BTreeMap::from([(
+                        RoomIdOrAllRooms::AllRooms,
+                        RoomRetentionEventContent::new().at_most(ONE_WEEK).unwrap(),
+                    )]),
+                    RetentionLimits::default(),
+                )
+                .mount_as_scoped()
+                .await;
+
+            client.fetch_retention_configuration().await.unwrap();
+        }
+
+        // Expire the cached value.
+        let mut cached = client.inner.caches.retention_configuration.get().unwrap();
+        cached.expire();
+        client.inner.caches.retention_configuration.set(Some(cached));
+
+        // The stale cached value is used without making a request.
+        let _mock =
+            server.mock_get_retention_configuration().ok_empty().never().mount_as_scoped().await;
+
+        let result = room.effective_retention(false).await.unwrap().unwrap();
+        assert_eq!(result.max_lifetime(), Some(ONE_WEEK));
     }
 
     #[async_test]
@@ -5644,20 +5807,112 @@ mod tests {
         let client = server.client_builder().build().await;
         let room = server.sync_joined_room(&client, retention_room_id()).await;
 
-        let _mock = mock_retention_config(
-            &server,
-            serde_json::json!({
-                "policies": {
-                    "*": { "max_lifetime": ONE_WEEK.as_millis() as u64 }
-                },
-                "limits": {},
-            }),
-        )
-        .await;
+        let _mock = server
+            .mock_get_retention_configuration()
+            .ok(
+                BTreeMap::from([(
+                    RoomIdOrAllRooms::AllRooms,
+                    RoomRetentionEventContent::new().at_most(ONE_WEEK).unwrap(),
+                )]),
+                RetentionLimits::default(),
+            )
+            .mount_as_scoped()
+            .await;
 
-        let result = room.effective_retention().await.unwrap().unwrap();
+        let result = room.effective_retention(true).await.unwrap().unwrap();
         assert_eq!(result.max_lifetime(), Some(ONE_WEEK));
         assert!(result.min_lifetime().is_none());
+    }
+
+    #[async_test]
+    async fn test_subscribe_to_effective_retention() {
+        use futures_util::pin_mut;
+        use stream_assert::assert_pending;
+
+        use crate::assert_next_matches_with_timeout;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = server.sync_joined_room(&client, retention_room_id()).await;
+        let f = EventFactory::new().sender(user_id!("@alice:b.c"));
+
+        let stream = room.subscribe_to_effective_retention();
+        pin_mut!(stream);
+
+        // The server configuration was never fetched.
+        assert_next_matches_with_timeout!(stream, None);
+        assert_pending!(stream);
+
+        // The server configuration is fetched: the server default applies.
+        {
+            let _mock = server
+                .mock_get_retention_configuration()
+                .ok(
+                    BTreeMap::from([(
+                        RoomIdOrAllRooms::AllRooms,
+                        RoomRetentionEventContent::new().at_most(ONE_WEEK).unwrap(),
+                    )]),
+                    RetentionLimits::default(),
+                )
+                .mount_as_scoped()
+                .await;
+
+            client.fetch_retention_configuration().await.unwrap();
+        }
+
+        assert_next_matches_with_timeout!(stream, Some(retention) => {
+            assert_eq!(retention.max_lifetime(), Some(ONE_WEEK));
+        });
+        assert_pending!(stream);
+
+        // The room sets its own retention policy.
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(retention_room_id()).add_state_event(
+                    f.event(RoomRetentionEventContent::new().at_most(ONE_DAY).unwrap())
+                        .state_key(""),
+                ),
+            )
+            .await;
+
+        assert_next_matches_with_timeout!(stream, Some(retention) => {
+            assert_eq!(retention.max_lifetime(), Some(ONE_DAY));
+        });
+        assert_pending!(stream);
+
+        // A room info change unrelated to the retention doesn't yield anything.
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(retention_room_id()).add_state_event(f.room_name("Name")),
+            )
+            .await;
+
+        assert_pending!(stream);
+
+        // The server configuration is refreshed with a per-room override, which
+        // takes precedence over the room's policy.
+        {
+            let _mock = server
+                .mock_get_retention_configuration()
+                .ok(
+                    BTreeMap::from([(
+                        RoomIdOrAllRooms::RoomId(retention_room_id().to_owned()),
+                        RoomRetentionEventContent::new().at_most(ONE_HOUR).unwrap(),
+                    )]),
+                    RetentionLimits::default(),
+                )
+                .mount_as_scoped()
+                .await;
+
+            client.fetch_retention_configuration().await.unwrap();
+        }
+
+        assert_next_matches_with_timeout!(stream, Some(retention) => {
+            assert_eq!(retention.max_lifetime(), Some(ONE_HOUR));
+        });
+        assert_pending!(stream);
     }
 
     #[async_test]
@@ -5673,19 +5928,25 @@ mod tests {
         )
         .await;
 
-        let _mock = mock_retention_config(
-            &server,
-            serde_json::json!({
-                "policies": {
-                    "*": { "max_lifetime": ONE_WEEK.as_millis() as u64 },
-                    "!a:b.c": { "max_lifetime": ONE_HOUR.as_millis() as u64 }
-                },
-                "limits": {},
-            }),
-        )
-        .await;
+        let _mock = server
+            .mock_get_retention_configuration()
+            .ok(
+                BTreeMap::from([
+                    (
+                        RoomIdOrAllRooms::AllRooms,
+                        RoomRetentionEventContent::new().at_most(ONE_WEEK).unwrap(),
+                    ),
+                    (
+                        RoomIdOrAllRooms::RoomId(retention_room_id().to_owned()),
+                        RoomRetentionEventContent::new().at_most(ONE_HOUR).unwrap(),
+                    ),
+                ]),
+                RetentionLimits::default(),
+            )
+            .mount_as_scoped()
+            .await;
 
-        let result = room.effective_retention().await.unwrap().unwrap();
+        let result = room.effective_retention(true).await.unwrap().unwrap();
         assert_eq!(result.max_lifetime(), Some(ONE_HOUR));
     }
 
@@ -5695,7 +5956,7 @@ mod tests {
             description: &'static str,
             room_max: Option<Duration>,
             room_min: Option<Duration>,
-            limits: serde_json::Value,
+            limits: RetentionLimits,
             expected_max: Option<Duration>,
             expected_min: Option<Duration>,
         }
@@ -5705,7 +5966,7 @@ mod tests {
                 description: "room sets `max_lifetime` only, no server limits configured",
                 room_max: Some(ONE_DAY),
                 room_min: None,
-                limits: serde_json::json!({}),
+                limits: RetentionLimits::default(),
                 expected_max: Some(ONE_DAY),
                 expected_min: None,
             },
@@ -5713,7 +5974,7 @@ mod tests {
                 description: "room sets `min_lifetime` only, no server limits configured",
                 room_max: None,
                 room_min: Some(ONE_HOUR),
-                limits: serde_json::json!({}),
+                limits: RetentionLimits::default(),
                 expected_max: None,
                 expected_min: Some(ONE_HOUR),
             },
@@ -5721,7 +5982,7 @@ mod tests {
                 description: "room sets `max_lifetime` and `min_lifetime`, no server limits configured",
                 room_max: Some(ONE_DAY),
                 room_min: Some(ONE_HOUR),
-                limits: serde_json::json!({}),
+                limits: RetentionLimits::default(),
                 expected_max: Some(ONE_DAY),
                 expected_min: Some(ONE_HOUR),
             },
@@ -5729,9 +5990,7 @@ mod tests {
                 description: "room `max_lifetime` above server `max_lifetime.max` → outcome uses server `max_lifetime.max`",
                 room_max: Some(ONE_WEEK),
                 room_min: None,
-                limits: serde_json::json!({
-                    "max_lifetime": { "max": ONE_DAY.as_millis() as u64 }
-                }),
+                limits: RetentionLimits::new(None, LifetimeLimits::from_range(..=ONE_DAY)),
                 expected_max: Some(ONE_DAY),
                 expected_min: None,
             },
@@ -5739,9 +5998,7 @@ mod tests {
                 description: "room `max_lifetime` below server `max_lifetime.min` → outcome uses server `max_lifetime.min`",
                 room_max: Some(ONE_HOUR),
                 room_min: None,
-                limits: serde_json::json!({
-                    "max_lifetime": { "min": ONE_DAY.as_millis() as u64 }
-                }),
+                limits: RetentionLimits::new(None, LifetimeLimits::from_range(ONE_DAY..)),
                 expected_max: Some(ONE_DAY),
                 expected_min: None,
             },
@@ -5749,9 +6006,7 @@ mod tests {
                 description: "room `min_lifetime` above server `min_lifetime.max` → outcome uses server `min_lifetime.max`",
                 room_max: None,
                 room_min: Some(ONE_WEEK),
-                limits: serde_json::json!({
-                    "min_lifetime": { "max": ONE_DAY.as_millis() as u64 }
-                }),
+                limits: RetentionLimits::new(LifetimeLimits::from_range(..=ONE_DAY), None),
                 expected_max: None,
                 expected_min: Some(ONE_DAY),
             },
@@ -5759,9 +6014,7 @@ mod tests {
                 description: "room `min_lifetime` below server `min_lifetime.min` → outcome uses server `min_lifetime.min`",
                 room_max: None,
                 room_min: Some(ONE_HOUR),
-                limits: serde_json::json!({
-                    "min_lifetime": { "min": ONE_DAY.as_millis() as u64 }
-                }),
+                limits: RetentionLimits::new(LifetimeLimits::from_range(ONE_DAY..), None),
                 expected_max: None,
                 expected_min: Some(ONE_DAY),
             },
@@ -5769,16 +6022,10 @@ mod tests {
                 description: "room `max_lifetime` and `min_lifetime` both within their respective server limits → unchanged",
                 room_max: Some(ONE_DAY),
                 room_min: Some(ONE_HOUR),
-                limits: serde_json::json!({
-                    "max_lifetime": {
-                        "min": ONE_HOUR.as_millis() as u64,
-                        "max": ONE_WEEK.as_millis() as u64,
-                    },
-                    "min_lifetime": {
-                        "min": Duration::from_secs(60).as_millis() as u64,
-                        "max": ONE_DAY.as_millis() as u64,
-                    },
-                }),
+                limits: RetentionLimits::new(
+                    LifetimeLimits::from_range(Duration::from_secs(60)..=ONE_DAY),
+                    LifetimeLimits::from_range(ONE_HOUR..=ONE_WEEK),
+                ),
                 expected_max: Some(ONE_DAY),
                 expected_min: Some(ONE_HOUR),
             },
@@ -5786,9 +6033,7 @@ mod tests {
                 description: "room `max_lifetime` omitted, server `max_lifetime.min` is used",
                 room_max: None,
                 room_min: None,
-                limits: serde_json::json!({
-                    "max_lifetime": { "min": ONE_DAY.as_millis() as u64 }
-                }),
+                limits: RetentionLimits::new(None, LifetimeLimits::from_range(ONE_DAY..)),
                 expected_max: Some(ONE_DAY),
                 expected_min: None,
             },
@@ -5796,9 +6041,7 @@ mod tests {
                 description: "room `min_lifetime` omitted, server `min_lifetime.min` is used",
                 room_max: None,
                 room_min: None,
-                limits: serde_json::json!({
-                    "min_lifetime": { "min": ONE_HOUR.as_millis() as u64 }
-                }),
+                limits: RetentionLimits::new(LifetimeLimits::from_range(ONE_HOUR..), None),
                 expected_max: None,
                 expected_min: Some(ONE_HOUR),
             },
@@ -5806,10 +6049,10 @@ mod tests {
                 description: "independently-clamped `max_lifetime`/`min_lifetime` cross → `min_lifetime` capped down to `max_lifetime`",
                 room_max: Some(ONE_DAY),
                 room_min: Some(ONE_HOUR),
-                limits: serde_json::json!({
-                    "max_lifetime": { "max": ONE_HOUR.as_millis() as u64 },
-                    "min_lifetime": { "min": ONE_WEEK.as_millis() as u64 },
-                }),
+                limits: RetentionLimits::new(
+                    LifetimeLimits::from_range(ONE_WEEK..),
+                    LifetimeLimits::from_range(..=ONE_HOUR),
+                ),
                 expected_max: Some(ONE_HOUR),
                 expected_min: Some(ONE_HOUR),
             },
@@ -5817,9 +6060,7 @@ mod tests {
                 description: "room `max_lifetime` omitted, server sets `max_lifetime.max` but no `.min` → stays unbounded (documents MSC1763 gap)",
                 room_max: None,
                 room_min: None,
-                limits: serde_json::json!({
-                    "max_lifetime": { "max": ONE_WEEK.as_millis() as u64 }
-                }),
+                limits: RetentionLimits::new(None, LifetimeLimits::from_range(..=ONE_WEEK)),
                 expected_max: None,
                 expected_min: None,
             },
@@ -5839,17 +6080,14 @@ mod tests {
 
             let room = room_with_retention(&server, &client, content).await;
 
-            let _mock = mock_retention_config(
-                &server,
-                serde_json::json!({
-                    "policies": {},
-                    "limits": case.limits,
-                }),
-            )
-            .await;
+            let _mock = server
+                .mock_get_retention_configuration()
+                .ok(BTreeMap::new(), case.limits)
+                .mount_as_scoped()
+                .await;
 
             let result = room
-                .effective_retention()
+                .effective_retention(true)
                 .await
                 .unwrap_or_else(|e| panic!("{}: effective_retention failed: {e}", case.description))
                 .unwrap_or_else(|| panic!("{}: expected Some, got None", case.description));

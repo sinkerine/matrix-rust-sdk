@@ -15,6 +15,7 @@
 //! An SQLite-based backend for the [`MediaStore`].
 
 use std::{
+    collections::{BTreeMap, HashMap},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -34,7 +35,7 @@ use matrix_sdk_base::{
     timer,
 };
 use matrix_sdk_store_encryption::StoreCipher;
-use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, time::SystemTime};
+use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, OwnedMxcUri, time::SystemTime};
 use rusqlite::{OptionalExtension, params_from_iter};
 use tokio::{
     fs,
@@ -65,7 +66,7 @@ mod keys {
 }
 
 /// The database name.
-const DATABASE_NAME: &str = "matrix-sdk-media.sqlite3";
+pub const DATABASE_NAME: &str = "matrix-sdk-media.sqlite3";
 
 /// An SQLite-based media store.
 #[derive(Clone)]
@@ -217,6 +218,15 @@ impl SqliteMediaStore {
 
         let connection = write_connection.lock_owned().await;
 
+        // Specify a busy timeout so that operations are automatically retried,
+        // in case the database was marked as locked, which can happen
+        // under very peculiar circumstances in WAL mode.
+        //
+        // The timeout value is in milliseconds.
+        //
+        // See also https://www.sqlite.org/wal.html#sometimes_queries_return_sqlite_busy_in_wal_mode.
+        connection.execute_batch("PRAGMA busy_timeout = 2000;").await?;
+
         // Per https://www.sqlite.org/foreignkeys.html#fk_enable, foreign key
         // support must be enabled on a per-connection basis. Execute it every
         // time we try to get a connection, since we can't guarantee a previous
@@ -279,7 +289,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
         // fails with the error message: "cannot change into wal mode from
         // within a transaction".
         conn.execute_batch("PRAGMA journal_mode = wal;").await?;
-        conn.with_transaction(|txn| {
+        conn.with_immediate_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/media_store/001_init.sql"))?;
             txn.set_db_version(1)
         })
@@ -288,7 +298,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
 
     if version < 2 {
         debug!("Upgrading database to version 2");
-        conn.with_transaction(|txn| {
+        conn.with_immediate_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/media_store/002_lease_locks_with_generation.sql"
             ))?;
@@ -321,7 +331,7 @@ impl MediaStore for SqliteMediaStore {
         let generation = self
             .write()
             .await?
-            .with_transaction(move |txn| {
+            .with_immediate_transaction(move |txn| {
                 txn.query_one(
                     "INSERT INTO lease_locks (key, holder, expiration)
                     VALUES (?1, ?2, ?3)
@@ -467,6 +477,50 @@ impl MediaStore for SqliteMediaStore {
     async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
         self.get_db_size().await
     }
+
+    #[instrument(skip_all)]
+    async fn media_sizes(
+        &self,
+        uris: &[OwnedMxcUri],
+    ) -> Result<BTreeMap<OwnedMxcUri, u64>, Self::Error> {
+        let _timer = timer!("method");
+
+        if uris.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut lookup = HashMap::with_capacity(uris.len());
+        let mut keys = Vec::with_capacity(uris.len());
+        for uri in uris {
+            let key = self.encode_key(keys::MEDIA, uri.as_str());
+            lookup.insert(key.to_vec(), uri.clone());
+            keys.push(key);
+        }
+
+        let sizes = self
+            .read()
+            .await?
+            .chunk_large_query_over(keys, None, move |txn, chunk| {
+                let sql = format!(
+                    "SELECT uri, sum(length(data)) FROM media WHERE uri IN ({}) GROUP BY uri",
+                    chunk.host_parameters()
+                );
+                let mut stmt = txn.prepare(&sql)?;
+                let mut sizes = Vec::new();
+                let rows = stmt.query(params_from_iter(chunk.iter()))?;
+                for row in rows.mapped(|row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?)))
+                {
+                    let (key, size) = row?;
+                    if let Some(uri) = lookup.get(&key) {
+                        sizes.push((uri.clone(), size));
+                    }
+                }
+                Ok(sizes)
+            })
+            .await?;
+
+        Ok(sizes.into_iter().collect())
+    }
 }
 
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
@@ -547,9 +601,10 @@ impl MediaStoreInner for SqliteMediaStore {
         let format = self.encode_key(keys::MEDIA, request.format.unique_key());
         let timestamp = time_to_timestamp(current_time);
 
-        let conn = self.write().await?;
-        let data = conn
-            .with_transaction::<_, rusqlite::Error, _>(move |txn| {
+        let data = self
+            .write()
+            .await?
+            .with_immediate_transaction(move |txn| {
                 // Update the last access. We need to do this first so the
                 // transaction is in write mode right away. See:
                 // https://sqlite.org/lang_transaction.html#read_transactions_versus_write_transactions
@@ -580,9 +635,10 @@ impl MediaStoreInner for SqliteMediaStore {
             return Ok(());
         }
 
-        let conn = self.write().await?;
+        let conn = self.read().await?;
+
         let removed = conn
-            .with_transaction::<_, Error, _>(move |txn| {
+            .with_immediate_transaction::<_, Self::Error, _>(move |txn| {
                 let mut removed = false;
 
                 // First, check media content that exceed the max filesize.

@@ -1,13 +1,15 @@
-use std::{assert_matches, collections::BTreeSet};
+use std::{assert_matches, collections::BTreeSet, time::Duration};
 
+use futures_util::{StreamExt, pin_mut};
 use matrix_sdk::{
+    config::SyncSettings,
     deserialized_responses::RawSyncOrStrippedState,
     test_utils::mocks::{AnyRoomBuilder, MatrixMockServer},
 };
 use matrix_sdk_base::RoomMemberships;
 use matrix_sdk_test::{
-    InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, async_test,
-    event_factory::EventFactory,
+    InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, TestRoom, TestRoomAlias, User,
+    async_test, event_factory::EventFactory,
 };
 use ruma::{
     EventEncryptionAlgorithm, MilliSecondsSinceUnixEpoch, RoomVersionId, event_id,
@@ -29,15 +31,14 @@ use ruma::{
             topic::RoomTopicEventContent,
         },
     },
-    mxc_uri, owned_user_id,
+    mxc_uri,
     room::JoinRule,
-    room_alias_id, room_id,
     serde::Raw,
-    user_id,
 };
 use serde_json::json;
-use strass::assert_let;
+use strass::{assert_let, assert_variant_eq};
 use stream_assert::{assert_pending, assert_ready};
+use tokio::time::timeout;
 
 #[async_test]
 async fn test_receive_room_encryption_event_via_sync() {
@@ -45,8 +46,8 @@ async fn test_receive_room_encryption_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_matches!(room.encryption_settings(), None);
@@ -76,7 +77,7 @@ async fn test_receive_room_encryption_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -119,7 +120,7 @@ async fn test_receive_room_encryption_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -159,7 +160,7 @@ async fn test_receive_room_encryption_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -189,8 +190,8 @@ async fn test_receive_room_avatar_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_eq!(room.avatar_url(), None);
@@ -221,7 +222,7 @@ async fn test_receive_room_avatar_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -258,7 +259,7 @@ async fn test_receive_room_avatar_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -295,7 +296,7 @@ async fn test_receive_room_avatar_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -322,8 +323,8 @@ async fn test_receive_room_name_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_eq!(room.name(), None);
@@ -354,7 +355,7 @@ async fn test_receive_room_name_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -391,7 +392,7 @@ async fn test_receive_room_name_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -428,7 +429,7 @@ async fn test_receive_room_name_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -455,8 +456,8 @@ async fn test_receive_room_create_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_matches!(room.create_content(), None);
@@ -486,7 +487,7 @@ async fn test_receive_room_create_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -523,7 +524,7 @@ async fn test_receive_room_create_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -546,7 +547,7 @@ async fn test_receive_room_create_event_via_sync() {
 
     // We checked that the create content is immutable, now let us try again
     // with a new room to see if the event would even be accepted.
-    let room_id = room_id!("!def");
+    let room_id = TestRoom::V12;
     let room = server.sync_joined_room(&client, room_id).await;
 
     // The new room info is empty and there is no state event.
@@ -554,11 +555,11 @@ async fn test_receive_room_create_event_via_sync() {
     assert_matches!(room.get_state_event_static::<RoomCreateEventContent>().await, Ok(None));
 
     // Listen to raw and deserialized events in the new room.
-    let raw_event_observer =
-        client.observe_room_events::<Raw<SyncStateEvent<RoomCreateEventContent>>, ()>(room_id);
+    let raw_event_observer = client
+        .observe_room_events::<Raw<SyncStateEvent<RoomCreateEventContent>>, ()>(room_id.into());
     let mut raw_event_subscriber = raw_event_observer.subscribe();
     let event_observer =
-        client.observe_room_events::<SyncStateEvent<RoomCreateEventContent>, ()>(room_id);
+        client.observe_room_events::<SyncStateEvent<RoomCreateEventContent>, ()>(room_id.into());
     let mut event_subscriber = event_observer.subscribe();
 
     // Receive the event with the invalid content in the new room.
@@ -630,8 +631,8 @@ async fn test_receive_room_history_visibility_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_eq!(room.history_visibility(), None);
@@ -664,7 +665,7 @@ async fn test_receive_room_history_visibility_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -701,7 +702,7 @@ async fn test_receive_room_history_visibility_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -738,7 +739,7 @@ async fn test_receive_room_history_visibility_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -765,8 +766,8 @@ async fn test_receive_room_guest_access_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info uses the default and there is no state event.
     assert_eq!(room.guest_access(), GuestAccess::Forbidden);
@@ -796,7 +797,7 @@ async fn test_receive_room_guest_access_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -833,7 +834,7 @@ async fn test_receive_room_guest_access_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -871,7 +872,7 @@ async fn test_receive_room_guest_access_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -898,8 +899,8 @@ async fn test_receive_room_join_rules_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_eq!(room.join_rule(), None);
@@ -929,7 +930,7 @@ async fn test_receive_room_join_rules_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -966,7 +967,7 @@ async fn test_receive_room_join_rules_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1003,7 +1004,7 @@ async fn test_receive_room_join_rules_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1030,8 +1031,8 @@ async fn test_receive_room_canonical_alias_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_eq!(room.canonical_alias(), None);
@@ -1049,7 +1050,7 @@ async fn test_receive_room_canonical_alias_event_via_sync() {
     let mut event_subscriber = event_observer.subscribe();
 
     // First we receive a valid event.
-    let room_alias = room_alias_id!("#myroom:localhost");
+    let room_alias = TestRoomAlias::Canonical;
     let valid_raw_event = Raw::new(&json!({
         "content": {
             "alias": room_alias,
@@ -1065,12 +1066,12 @@ async fn test_receive_room_canonical_alias_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
     // The room info is set and the valid state event is in the store.
-    assert_eq!(room.canonical_alias().as_deref(), Some(room_alias));
+    assert_variant_eq!(room.canonical_alias(), Some(room_alias));
     assert_let!(
         Ok(Some(RawSyncOrStrippedState::Sync(raw_event))) =
             room.get_state_event_static::<RoomCanonicalAliasEventContent>().await
@@ -1082,7 +1083,7 @@ async fn test_receive_room_canonical_alias_event_via_sync() {
     let (raw_event, _) = assert_ready!(raw_event_subscriber);
     assert_eq!(raw_event.json().get(), valid_raw_event.json().get());
     let (event, _) = assert_ready!(event_subscriber);
-    assert_eq!(event.as_original().unwrap().content.alias.as_deref(), Some(room_alias));
+    assert_variant_eq!(event.as_original().unwrap().content.alias, Some(room_alias));
 
     // Now we receive an event with an invalid content but a valid type and
     // state key.
@@ -1102,7 +1103,7 @@ async fn test_receive_room_canonical_alias_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1139,7 +1140,7 @@ async fn test_receive_room_canonical_alias_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1166,8 +1167,8 @@ async fn test_receive_room_topic_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_eq!(room.topic(), None);
@@ -1198,7 +1199,7 @@ async fn test_receive_room_topic_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -1235,7 +1236,7 @@ async fn test_receive_room_topic_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1272,7 +1273,7 @@ async fn test_receive_room_topic_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1299,8 +1300,8 @@ async fn test_receive_room_tombstone_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_matches!(room.tombstone_content(), None);
@@ -1315,7 +1316,7 @@ async fn test_receive_room_tombstone_event_via_sync() {
     let mut event_subscriber = event_observer.subscribe();
 
     // First we receive a valid event.
-    let tombstone_replacement = room_id!("!replacement");
+    let tombstone_replacement = TestRoom::Other;
     let valid_raw_event = Raw::new(&json!({
         "content": {
             "body": "!",
@@ -1332,13 +1333,13 @@ async fn test_receive_room_tombstone_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
     // The room info is set and the valid state event is in the store.
-    assert_eq!(
-        room.tombstone_content().unwrap().replacement_room.as_deref(),
+    assert_variant_eq!(
+        room.tombstone_content().unwrap().replacement_room,
         Some(tombstone_replacement)
     );
     assert_let!(
@@ -1373,7 +1374,7 @@ async fn test_receive_room_tombstone_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1411,7 +1412,7 @@ async fn test_receive_room_tombstone_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1438,8 +1439,8 @@ async fn test_receive_room_power_levels_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info uses the default and there is no state event.
     assert_matches!(room.max_power_level(), 100);
@@ -1469,7 +1470,7 @@ async fn test_receive_room_power_levels_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -1506,7 +1507,7 @@ async fn test_receive_room_power_levels_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1543,7 +1544,7 @@ async fn test_receive_room_power_levels_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1570,8 +1571,8 @@ async fn test_receive_room_pinned_events_event_via_sync() {
     let client = server.client_builder().build().await;
 
     let user_id = client.user_id().unwrap();
-    let room_id = room_id!("!abc");
-    let room = server.sync_joined_room(&client, room_id).await;
+    let room = server.sync_default_joined_room(&client).await;
+    let room_id = room.room_id();
 
     // The room info is empty and there is no state event.
     assert_eq!(room.pinned_event_ids(), None);
@@ -1602,7 +1603,7 @@ async fn test_receive_room_pinned_events_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![valid_raw_event.clone()]),
+            JoinedRoomBuilder::default().add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
@@ -1639,7 +1640,7 @@ async fn test_receive_room_pinned_events_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1676,7 +1677,7 @@ async fn test_receive_room_pinned_events_event_via_sync() {
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::default()
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1718,7 +1719,7 @@ async fn test_receive_stripped_room_encryption_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithvalidencryption"))
+            InvitedRoomBuilder::new(TestRoom::Default)
                 .add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
@@ -1748,7 +1749,7 @@ async fn test_receive_stripped_room_encryption_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithredactedencryption"))
+            InvitedRoomBuilder::new(TestRoom::Invited)
                 .add_state_bulk(vec![redacted_raw_event.clone()]),
         )
         .await;
@@ -1779,7 +1780,7 @@ async fn test_receive_stripped_room_encryption_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidencryptioncontent"))
+            InvitedRoomBuilder::new(TestRoom::Other)
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1809,7 +1810,7 @@ async fn test_receive_stripped_room_encryption_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidencryptionstatekey"))
+            InvitedRoomBuilder::new(TestRoom::V12)
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1841,7 +1842,7 @@ async fn test_receive_stripped_room_avatar_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithvalidname"))
+            InvitedRoomBuilder::new(TestRoom::Default)
                 .add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
@@ -1872,7 +1873,7 @@ async fn test_receive_stripped_room_avatar_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidavatarcontent"))
+            InvitedRoomBuilder::new(TestRoom::Invited)
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1902,7 +1903,7 @@ async fn test_receive_stripped_room_avatar_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidavatarstatekey"))
+            InvitedRoomBuilder::new(TestRoom::Other)
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -1934,7 +1935,7 @@ async fn test_receive_stripped_room_name_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithvalidname"))
+            KnockedRoomBuilder::new(TestRoom::Default)
                 .add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
@@ -1965,7 +1966,7 @@ async fn test_receive_stripped_room_name_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithinvalidnamecontent"))
+            KnockedRoomBuilder::new(TestRoom::Other)
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -1995,7 +1996,7 @@ async fn test_receive_stripped_room_name_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithinvalidnamestatekey"))
+            KnockedRoomBuilder::new(TestRoom::V12)
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -2026,7 +2027,7 @@ async fn test_receive_stripped_room_create_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithvalidcreate"))
+            KnockedRoomBuilder::new(TestRoom::Default)
                 .add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
@@ -2057,7 +2058,7 @@ async fn test_receive_stripped_room_create_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithinvalidcreatecontent"))
+            KnockedRoomBuilder::new(TestRoom::Other)
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -2087,7 +2088,7 @@ async fn test_receive_stripped_room_create_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithinvalidcreatestatekey"))
+            KnockedRoomBuilder::new(TestRoom::V12)
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -2118,7 +2119,7 @@ async fn test_receive_stripped_room_join_rules_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithvalidjoinrules"))
+            InvitedRoomBuilder::new(TestRoom::Default)
                 .add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
@@ -2149,7 +2150,7 @@ async fn test_receive_stripped_room_join_rules_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidjoinrulescontent"))
+            InvitedRoomBuilder::new(TestRoom::Other)
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -2179,7 +2180,7 @@ async fn test_receive_stripped_room_join_rules_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidjoinrulesstatekey"))
+            InvitedRoomBuilder::new(TestRoom::V12)
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -2196,7 +2197,7 @@ async fn test_receive_stripped_room_canonical_alias_event_via_sync() {
     let user_id = client.user_id().unwrap();
 
     // First we receive a valid event.
-    let room_alias = room_alias_id!("#myroom:localhost");
+    let room_alias = TestRoomAlias::Canonical;
     let valid_raw_event = Raw::new(&json!({
         "content": {
             "alias": room_alias,
@@ -2211,13 +2212,13 @@ async fn test_receive_stripped_room_canonical_alias_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithvalidcanonicalalias"))
+            InvitedRoomBuilder::new(TestRoom::Default)
                 .add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
 
     // The room info is set and the valid state event is in the store.
-    assert_eq!(room.canonical_alias().as_deref(), Some(room_alias));
+    assert_variant_eq!(room.canonical_alias(), Some(room_alias));
     assert_let!(
         Ok(Some(RawSyncOrStrippedState::Stripped(raw_event))) =
             room.get_state_event_static::<RoomCanonicalAliasEventContent>().await
@@ -2242,7 +2243,7 @@ async fn test_receive_stripped_room_canonical_alias_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidcanonicalaliascontent"))
+            InvitedRoomBuilder::new(TestRoom::Invited)
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -2272,7 +2273,7 @@ async fn test_receive_stripped_room_canonical_alias_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            InvitedRoomBuilder::new(room_id!("!roomwithinvalidcanonicalaliasstatekey"))
+            InvitedRoomBuilder::new(TestRoom::Other)
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -2307,7 +2308,7 @@ async fn test_receive_stripped_room_topic_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithvalidtopic"))
+            KnockedRoomBuilder::new(TestRoom::Default)
                 .add_state_bulk(vec![valid_raw_event.clone()]),
         )
         .await;
@@ -2338,7 +2339,7 @@ async fn test_receive_stripped_room_topic_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithinvalidtopiccontent"))
+            KnockedRoomBuilder::new(TestRoom::Other)
                 .add_state_bulk(vec![raw_event_with_invalid_content.clone()]),
         )
         .await;
@@ -2368,7 +2369,7 @@ async fn test_receive_stripped_room_topic_event_via_sync() {
     let room = server
         .sync_room(
             &client,
-            KnockedRoomBuilder::new(room_id!("!roomwithinvalidtopicstatekey"))
+            KnockedRoomBuilder::new(TestRoom::V12)
                 .add_state_bulk(vec![raw_event_with_invalid_state_key.clone()]),
         )
         .await;
@@ -2383,27 +2384,22 @@ async fn test_update_active_service_members() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
     let user_id = client.user_id().unwrap();
-    let service_member_id_1 = owned_user_id!("@service_1:localhost");
-    let service_member_id_2 = owned_user_id!("@service_2:localhost");
+    let service_member_id_1 = User::Alice;
+    let service_member_id_2 = User::Bob;
+    let f = EventFactory::new().default_room();
 
-    let room_id = room_id!("!room:localhost");
-    let service_members_event = EventFactory::new()
-        .room(room_id)
+    let service_members_event = f
+        .member_hints(BTreeSet::from([service_member_id_1.into(), service_member_id_2.into()]))
         .sender(user_id)
-        .member_hints(BTreeSet::from_iter(vec![
-            service_member_id_1.clone(),
-            service_member_id_2.clone(),
-        ]))
         .into_raw_sync_state();
-    let own_member_event =
-        EventFactory::new().room(room_id).member(user_id).display_name("Me").into_raw_sync_state();
+    let own_member_event = f.member(user_id).display_name("Me").into_raw_sync_state();
 
     // We start with just the room and our own member event, no service events
     let room = server
         .sync_room(
             &client,
             AnyRoomBuilder::Joined(
-                JoinedRoomBuilder::new(room_id)
+                JoinedRoomBuilder::default()
                     .add_state_event(own_member_event)
                     .add_state_event(service_members_event),
             ),
@@ -2419,15 +2415,11 @@ async fn test_update_active_service_members() {
     assert!(room.active_service_members_count().is_none());
 
     // Now another user joined the room
-    let human_user = EventFactory::new()
-        .room(room_id)
-        .member(user_id!("@human:localhost"))
-        .display_name("Human")
-        .into_raw_sync_state();
+    let human_user = f.member(User::Carol).display_name("Human").into_raw_sync_state();
     let room = server
         .sync_room(
             &client,
-            AnyRoomBuilder::Joined(JoinedRoomBuilder::new(room_id).add_state_event(human_user)),
+            AnyRoomBuilder::Joined(JoinedRoomBuilder::default().add_state_event(human_user)),
         )
         .await;
 
@@ -2440,14 +2432,11 @@ async fn test_update_active_service_members() {
     assert!(room.active_service_members_count().is_none());
 
     // Now one of the service members in the member hints joined the room
-    let service_member_1 =
-        EventFactory::new().room(room_id).member(&service_member_id_1).into_raw_sync_state();
+    let service_member_1 = f.member(service_member_id_1).into_raw_sync_state();
     let room = server
         .sync_room(
             &client,
-            AnyRoomBuilder::Joined(
-                JoinedRoomBuilder::new(room_id).add_state_event(service_member_1),
-            ),
+            AnyRoomBuilder::Joined(JoinedRoomBuilder::default().add_state_event(service_member_1)),
         )
         .await;
 
@@ -2460,14 +2449,11 @@ async fn test_update_active_service_members() {
     assert_eq!(room.active_service_members_count().unwrap_or_default(), 1);
 
     // And a second one joins too
-    let service_member_2 =
-        EventFactory::new().room(room_id).member(&service_member_id_2).into_raw_sync_state();
+    let service_member_2 = f.member(service_member_id_2).into_raw_sync_state();
     let room = server
         .sync_room(
             &client,
-            AnyRoomBuilder::Joined(
-                JoinedRoomBuilder::new(room_id).add_state_event(service_member_2),
-            ),
+            AnyRoomBuilder::Joined(JoinedRoomBuilder::default().add_state_event(service_member_2)),
         )
         .await;
 
@@ -2480,16 +2466,12 @@ async fn test_update_active_service_members() {
     assert_eq!(room.active_service_members_count().unwrap_or_default(), 2);
 
     // And now the 2nd service member leaves the room
-    let service_member_2_left = EventFactory::new()
-        .room(room_id)
-        .member(&service_member_id_2)
-        .leave()
-        .into_raw_sync_state();
+    let service_member_2_left = f.member(service_member_id_2).leave().into_raw_sync_state();
     let room = server
         .sync_room(
             &client,
             AnyRoomBuilder::Joined(
-                JoinedRoomBuilder::new(room_id).add_state_event(service_member_2_left),
+                JoinedRoomBuilder::default().add_state_event(service_member_2_left),
             ),
         )
         .await;
@@ -2508,31 +2490,24 @@ async fn test_active_service_members_resets_when_member_counts_change() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
     let user_id = client.user_id().unwrap();
-    let service_member_id_1 = owned_user_id!("@service_1:localhost");
-    let service_member_id_2 = owned_user_id!("@service_2:localhost");
+    let service_member_id_1 = User::Alice;
+    let service_member_id_2 = User::Bob;
+    let f = EventFactory::new().default_room();
 
-    let room_id = room_id!("!room:localhost");
-    let service_members_event = EventFactory::new()
-        .room(room_id)
+    let service_members_event = f
+        .member_hints(BTreeSet::from([service_member_id_1.into(), service_member_id_2.into()]))
         .sender(user_id)
-        .member_hints(BTreeSet::from_iter(vec![
-            service_member_id_1.clone(),
-            service_member_id_2.clone(),
-        ]))
         .into_raw_sync_state();
-    let own_member_event =
-        EventFactory::new().room(room_id).member(user_id).display_name("Me").into_raw_sync_state();
-    let service_member_1 =
-        EventFactory::new().room(room_id).member(&service_member_id_1).into_raw_sync_state();
-    let service_member_2 =
-        EventFactory::new().room(room_id).member(&service_member_id_2).into_raw_sync_state();
+    let own_member_event = f.member(user_id).display_name("Me").into_raw_sync_state();
+    let service_member_1 = f.member(service_member_id_1).into_raw_sync_state();
+    let service_member_2 = f.member(service_member_id_2).into_raw_sync_state();
 
     // We start with just the room and our own member event, no service events
     let room = server
         .sync_room(
             &client,
             AnyRoomBuilder::Joined(
-                JoinedRoomBuilder::new(room_id)
+                JoinedRoomBuilder::default()
                     .add_state_event(own_member_event)
                     .add_state_event(service_member_1)
                     .add_state_event(service_member_2)
@@ -2553,7 +2528,7 @@ async fn test_active_service_members_resets_when_member_counts_change() {
     let room = server
         .sync_room(
             &client,
-            AnyRoomBuilder::Joined(JoinedRoomBuilder::new(room_id).set_joined_members_count(32)),
+            AnyRoomBuilder::Joined(JoinedRoomBuilder::default().set_joined_members_count(32)),
         )
         .await;
 
@@ -2566,31 +2541,24 @@ async fn test_cached_active_service_members_resets_when_member_counts_change() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
     let user_id = client.user_id().unwrap();
-    let service_member_id_1 = owned_user_id!("@service_1:localhost");
-    let service_member_id_2 = owned_user_id!("@service_2:localhost");
+    let service_member_id_1 = User::Alice;
+    let service_member_id_2 = User::Bob;
+    let f = EventFactory::new().default_room();
 
-    let room_id = room_id!("!room:localhost");
-    let service_members_event = EventFactory::new()
-        .room(room_id)
+    let service_members_event = f
+        .member_hints(BTreeSet::from([service_member_id_1.into(), service_member_id_2.into()]))
         .sender(user_id)
-        .member_hints(BTreeSet::from_iter(vec![
-            service_member_id_1.clone(),
-            service_member_id_2.clone(),
-        ]))
         .into_raw_sync_state();
-    let own_member_event =
-        EventFactory::new().room(room_id).member(user_id).display_name("Me").into_raw_sync_state();
-    let service_member_1 =
-        EventFactory::new().room(room_id).member(&service_member_id_1).into_raw();
-    let service_member_2 =
-        EventFactory::new().room(room_id).member(&service_member_id_2).into_raw();
+    let own_member_event = f.member(user_id).display_name("Me").into_raw_sync_state();
+    let service_member_1 = f.member(service_member_id_1).into_raw();
+    let service_member_2 = f.member(service_member_id_2).into_raw();
 
     // We start with just the room and our own member event, no service events
     let room = server
         .sync_room(
             &client,
             AnyRoomBuilder::Joined(
-                JoinedRoomBuilder::new(room_id)
+                JoinedRoomBuilder::default()
                     .add_state_event(own_member_event)
                     .add_state_event(service_member_1)
                     .add_state_event(service_member_2)
@@ -2611,7 +2579,7 @@ async fn test_cached_active_service_members_resets_when_member_counts_change() {
     let room = server
         .sync_room(
             &client,
-            AnyRoomBuilder::Joined(JoinedRoomBuilder::new(room_id).set_joined_members_count(32)),
+            AnyRoomBuilder::Joined(JoinedRoomBuilder::default().set_joined_members_count(32)),
         )
         .await;
 
@@ -2624,35 +2592,24 @@ async fn test_cached_active_service_members_updates_on_sync_members() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
     let user_id = client.user_id().unwrap();
-    let service_member_id_1 = owned_user_id!("@service_1:localhost");
-    let service_member_id_2 = owned_user_id!("@service_2:localhost");
+    let service_member_id_1 = User::Alice;
+    let service_member_id_2 = User::Bob;
+    let f = EventFactory::new().default_room();
 
-    let room_id = room_id!("!room:localhost");
-    let service_members_event = EventFactory::new()
-        .room(room_id)
+    let service_members_event = f
+        .member_hints(BTreeSet::from([service_member_id_1.into(), service_member_id_2.into()]))
         .sender(user_id)
-        .member_hints(BTreeSet::from_iter(vec![
-            service_member_id_1.clone(),
-            service_member_id_2.clone(),
-        ]))
         .into_raw_sync_state();
-    let own_member_event =
-        EventFactory::new().room(room_id).member(user_id).display_name("Me").into_raw_sync_state();
-    let service_member_1 = EventFactory::new()
-        .room(room_id)
-        .member(&service_member_id_1)
-        .into_raw::<RoomMemberEvent>();
-    let service_member_2 = EventFactory::new()
-        .room(room_id)
-        .member(&service_member_id_2)
-        .into_raw::<RoomMemberEvent>();
+    let own_member_event = f.member(user_id).display_name("Me").into_raw_sync_state();
+    let service_member_1 = f.member(service_member_id_1).into_raw::<RoomMemberEvent>();
+    let service_member_2 = f.member(service_member_id_2).into_raw::<RoomMemberEvent>();
 
     // We start with just the room and our own member event, no service events
     let room = server
         .sync_room(
             &client,
             AnyRoomBuilder::Joined(
-                JoinedRoomBuilder::new(room_id)
+                JoinedRoomBuilder::default()
                     .add_state_event(own_member_event)
                     .add_state_event(service_members_event),
             ),
@@ -2680,4 +2637,30 @@ async fn test_cached_active_service_members_updates_on_sync_members() {
     // We got some computed values after sync_members
     assert!(room.active_service_members_count().is_some());
     assert_eq!(room.active_service_members_count().unwrap(), 2);
+}
+
+#[async_test]
+async fn test_sync_loop_without_throttling() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    // The server responds immediately to every sync request.
+    server.mock_sync().ok(|_| {}).mount().await;
+
+    let sync_settings =
+        SyncSettings::new().timeout(Duration::from_millis(0)).throttle_sync_loop(false);
+    let sync_stream = client.sync_stream(sync_settings).await;
+    pin_mut!(sync_stream);
+
+    // With throttling enabled, each sync after the first one would be delayed
+    // by one second, so receiving 5 responses would take at least 4
+    // seconds. Without throttling, they should all arrive (way) under 2
+    // seconds.
+    timeout(Duration::from_secs(2), async {
+        for _ in 0..5 {
+            sync_stream.next().await.expect("the sync stream should not end").unwrap();
+        }
+    })
+    .await
+    .expect("syncs should not have been throttled");
 }

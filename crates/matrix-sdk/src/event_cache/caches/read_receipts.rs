@@ -100,9 +100,7 @@
 //! [`ThreadEventCache`]: super::thread::ThreadEventCache
 
 use std::{
-    borrow::Borrow,
     collections::HashSet,
-    hash::Hash,
     ops::{ControlFlow, Deref, DerefMut, Not},
 };
 
@@ -164,32 +162,17 @@ fn paginate_for_read_receipt(
     }
 }
 
-/// The receipt event ids the unread counts are still chasing, i.e. those whose
-/// target event hasn't been found in the linked chunk yet.
-pub(super) fn unresolved_receipt_targets(read_receipts: &ReadReceipts) -> HashSet<&EventId> {
-    read_receipts
-        .pending
-        .iter()
-        .map(|event_id| &**event_id)
-        .chain(read_receipts.latest_active.as_ref().map(|receipt| &*receipt.event_id))
-        .collect()
-}
-
-/// Whether `events` contains the target of one of `targets`.
-pub(super) fn contains_a_receipt_target<T>(events: &[TimelineEvent], targets: &HashSet<T>) -> bool
-where
-    T: Borrow<EventId> + Eq + Hash,
-{
-    events.iter().any(|event| event.event_id().is_some_and(|id| targets.contains(id)))
-}
-
 /// A stop predicate that fires as soon as a batch loads any of `targets`. With
 /// no targets it never fires, so the request runs to its batch cap.
 fn stop_on_event_ids(
     targets: HashSet<OwnedEventId>,
 ) -> impl FnMut(&BackPaginationOutcome) -> ControlFlow<()> + Send + 'static {
     move |outcome| {
-        if contains_a_receipt_target(&outcome.events, &targets) {
+        if outcome
+            .events
+            .iter()
+            .any(|event| event.event_id().is_some_and(|id| targets.contains(id)))
+        {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -646,8 +629,13 @@ pub(crate) async fn compute_unread_counts<T>(
     // even found the latest active receipt! Hand it the receipt event ids we're
     // chasing so the backfill can stop as soon as one of them is loaded.
     if let Some(back_pagination_queue) = back_pagination_queue {
-        let targets =
-            unresolved_receipt_targets(read_receipts).into_iter().map(ToOwned::to_owned).collect();
+        let targets = read_receipts
+            .pending
+            .iter()
+            .cloned()
+            .chain(read_receipts.latest_active.as_ref().map(|receipt| receipt.event_id.clone()))
+            .collect::<HashSet<_>>();
+
         paginate_for_read_receipt(back_pagination_queue, event_filter.room_id(), targets);
     }
 
@@ -777,7 +765,7 @@ mod tests {
 
     use matrix_sdk_base::{read_receipts::ReadReceipts, store::MemoryStore};
     use matrix_sdk_common::{deserialized_responses::TimelineEvent, ring_buffer::RingBuffer};
-    use matrix_sdk_test::{ALICE, event_factory::EventFactory};
+    use matrix_sdk_test::{User, event_factory::EventFactory};
     use ruma::{
         EventId, MilliSecondsSinceUnixEpoch, RoomId, UserId, event_id,
         events::{
@@ -803,10 +791,10 @@ mod tests {
     fn test_stop_on_event_ids() {
         use std::collections::HashSet;
 
-        use matrix_sdk_test::BOB;
+        use matrix_sdk_test::User;
 
         let room = room_id!("!omelette:fromage.fr");
-        let f = EventFactory::new().room(room).sender(*BOB);
+        let f = EventFactory::new().room(room).sender(User::Bob);
         let outcome = BackPaginationOutcome {
             reached_start: false,
             events: vec![
@@ -1197,7 +1185,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_noop() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
 
         // Create a non-empty linked chunk, with no messages sent by the current
         // user.
@@ -1241,7 +1229,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_implicit() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with one message sent by the current
@@ -1284,7 +1272,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_active_receipt() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
 
         // Create a non-empty linked chunk, with no messages sent by the current
         // user.
@@ -1328,7 +1316,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_new_receipt_event() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with no messages sent by the current
@@ -1378,7 +1366,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_stashes_pending_receipts() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with no messages sent by the current
@@ -1429,7 +1417,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_matched_pending_receipt() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with no messages sent by the current
@@ -1476,7 +1464,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_mixed() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with one message sent by the current

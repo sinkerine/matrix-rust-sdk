@@ -22,8 +22,6 @@ use std::{
 };
 
 use anyhow::{Context as _, anyhow};
-#[cfg(feature = "sqlite")]
-use matrix_sdk::STATE_STORE_DATABASE_NAME;
 #[cfg(not(target_family = "wasm"))]
 use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 use matrix_sdk::{
@@ -63,6 +61,10 @@ use matrix_sdk::{
     sync::Notification,
     task_monitor::BackgroundTaskFailureReason,
 };
+#[cfg(feature = "sqlite")]
+use matrix_sdk::{
+    EVENT_CACHE_STORE_DATABASE_NAME, MEDIA_STORE_DATABASE_NAME, STATE_STORE_DATABASE_NAME,
+};
 #[cfg(feature = "experimental-x509-identity-verification")]
 use matrix_sdk_base::crypto::x509::RawX509Signature;
 use matrix_sdk_common::{
@@ -84,6 +86,7 @@ use ruma::{
     api::{
         client::{
             alias::get_alias,
+            delayed_events::update_delayed_event::UpdateAction,
             discovery::get_authorization_server_metadata::v1::{
                 AccountManagementActionData, DeviceDeleteData, DeviceViewData,
             },
@@ -129,7 +132,7 @@ use tracing::{debug, error, warn};
 use url::Url;
 
 use super::{
-    room::{Room, room_info::RoomInfo},
+    room::{RequestConfigOverride, Room, room_info::RoomInfo},
     session_verification::SessionVerificationController,
 };
 use crate::{
@@ -151,8 +154,9 @@ use crate::{
     room_directory_search::RoomDirectorySearch,
     room_preview::RoomPreview,
     ruma::{
-        AccountDataEvent, AccountDataEventType, InviteAvatars, MediaPreviewConfig, MediaPreviews,
-        MediaSource, PresenceState, RoomAccountDataEvent, UserCall, UserStatus,
+        AccountDataEvent, AccountDataEventType, InviteAvatars, InvitePermissionAction,
+        InvitePermissionState, MediaPreviewConfig, MediaPreviews, MediaSource, PresenceState,
+        RoomAccountDataEvent, UserCall, UserStatus,
     },
     runtime::get_runtime_handle,
     spaces::SpaceService,
@@ -422,6 +426,12 @@ pub struct Client {
     #[cfg_attr(not(feature = "sqlite"), allow(unused))]
     store_path: Option<PathBuf>,
 
+    /// The path to the directory where the event cache store and the media
+    /// store are located, if the `Client` instance has been built with an
+    /// SQLite store.
+    #[cfg_attr(not(feature = "sqlite"), allow(unused))]
+    cache_path: Option<PathBuf>,
+
     content_scanner: RwLock<Option<Arc<ContentScanner>>>,
 }
 
@@ -430,6 +440,7 @@ impl Client {
         sdk_client: MatrixClient,
         session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
         store_path: Option<PathBuf>,
+        cache_path: Option<PathBuf>,
     ) -> Result<Self, ClientError> {
         let session_verification_controller: Arc<
             tokio::sync::RwLock<Option<SessionVerificationController>>,
@@ -467,6 +478,7 @@ impl Client {
             utd_hook_manager: OnceLock::new(),
             session_verification_controller,
             store_path,
+            cache_path,
             content_scanner: Default::default(),
         };
 
@@ -2237,11 +2249,12 @@ impl Client {
     /// it via dropping the previous and re-creating it, restarting their
     /// application, or any other similar means.
     ///
-    /// - This will get rid of the backing state store file, if provided.
     /// - This will empty all the room's persisted event caches, so all rooms
     ///   will start as if they were empty.
-    /// - This will empty the media cache according to the current media
-    ///   retention policy.
+    /// - This will delete the search index.
+    /// - This will close all the stores, then get rid of the backing state
+    ///   store, event cache store and media store files, if provided. The
+    ///   crypto store is kept.
     pub async fn clear_caches(
         &self,
         sync_service: Option<Arc<SyncService>>,
@@ -2252,59 +2265,46 @@ impl Client {
                 sync_service.inner.expire_sessions().await;
             }
 
-            // Disable the send queues, as they might read and write to the
-            // state store. Events being send might still be active, and cause
-            // errors if processing finishes, so this will only minimize damage.
-            // Since this method should only be called in exceptional cases,
-            // this has been deemed acceptable.
-            self.inner.send_queue().set_enabled(false).await;
+            // Disable the send queues, and close all the stores: in-flight
+            // operations complete, then the database connections are released,
+            // so the files below aren't deleted while still in use. This must
+            // come after expiring the sessions, which saves the reset sync
+            // position in the crypto store.
+            self.inner.pause().await?;
 
-            // Clean up the media cache according to the current media retention
-            // policy.
-            self.inner
-                .media_store()
-                .lock()
-                .await
-                .map_err(Error::from)?
-                .clean()
-                .await
-                .map_err(Error::from)?;
+            // Delete the search index, now that no new event can be saved, and
+            // indexed, anymore. It may share its directory with the stores, so
+            // only its own files are deleted.
+            #[cfg(feature = "experimental-search")]
+            self.inner.search_index().clear().await.map_err(ClientError::from_err)?;
 
-            // Clear all the room chunks. It's important to _not_ call
-            // `EventCacheStore::clear_all_events` here, because there might be
-            // live observers of the linked chunks, and that would cause some
-            // very bad state mismatch.
-            if let Some(event_cache) = self.inner.event_cache() {
-                event_cache.clear_all_rooms().await?;
-            }
-
-            // Delete the state store file, if it exists.
+            // Delete the store files, if they exist.
             #[cfg(feature = "sqlite")]
-            if let Some(store_path) = &self.store_path {
-                debug!("Removing the state store: {}", store_path.display());
-
+            if let (Some(store_path), Some(cache_path)) = (&self.store_path, &self.cache_path) {
                 // The state store and the crypto store both live in the same
                 // store path, so we can't blindly delete the directory.
                 //
-                // Delete the state store SQLite file, as well as the
-                // write-ahead log (WAL) and shared-memory (SHM) files, if they
-                // exist.
-
-                for file_name in [
-                    PathBuf::from(STATE_STORE_DATABASE_NAME),
-                    PathBuf::from(format!("{STATE_STORE_DATABASE_NAME}-wal")),
-                    PathBuf::from(format!("{STATE_STORE_DATABASE_NAME}-shm")),
+                // Delete the SQLite files, as well as the write-ahead log (WAL)
+                // and shared-memory (SHM) files, if they exist.
+                for (dir, database_name) in [
+                    (store_path, STATE_STORE_DATABASE_NAME),
+                    (cache_path, EVENT_CACHE_STORE_DATABASE_NAME),
+                    (cache_path, MEDIA_STORE_DATABASE_NAME),
                 ] {
-                    let file_path = store_path.join(file_name);
-                    if file_path.exists() {
-                        debug!("Removing file: {}", file_path.display());
-                        std::fs::remove_file(&file_path).map_err(|err| ClientError::Generic {
-                            msg: format!(
-                                "couldn't delete the state store file {}: {err}",
-                                file_path.display()
-                            ),
-                            details: None,
-                        })?;
+                    for suffix in ["", "-wal", "-shm"] {
+                        let file_path = dir.join(format!("{database_name}{suffix}"));
+                        if file_path.exists() {
+                            debug!("Removing file: {}", file_path.display());
+                            std::fs::remove_file(&file_path).map_err(|err| {
+                                ClientError::Generic {
+                                    msg: format!(
+                                        "couldn't delete the store file {}: {err}",
+                                        file_path.display()
+                                    ),
+                                    details: None,
+                                }
+                            })?;
+                        }
                     }
                 }
             }
@@ -2331,9 +2331,15 @@ impl Client {
     /// a fallback, unless well-known discovery was disabled with
     /// [`ClientBuilder::disable_well_known_lookup`] or
     /// [`Client::disable_well_known_lookup`].
+    ///
+    /// Both the `m.livekit` and the legacy `livekit` transport types count as
+    /// LiveKit support.
+    #[allow(deprecated)]
     pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
         let transports = self.inner.discover_rtc_transports().await?.unwrap_or_default();
-        Ok(transports.iter().any(|focus| matches!(focus, RumaRtcTransport::LiveKit { .. })))
+        Ok(transports.iter().any(|transport| {
+            matches!(transport, RumaRtcTransport::LiveKit(_) | RumaRtcTransport::LegacyLiveKit(_))
+        }))
     }
 
     /// Discover the RTC transports advertised by the homeserver.
@@ -2354,6 +2360,68 @@ impl Client {
             .discover_rtc_transports()
             .await?
             .map(|transports| transports.iter().map(Into::into).collect()))
+    }
+
+    /// Obtain a JWT to authenticate with a LiveKit SFU, through the
+    /// homeserver's `/rtc/livekit/get_token` endpoint (MSC4195).
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The WebSocket URL of the LiveKit SFU to obtain a token for.
+    /// * `room_id` - The room where the `m.rtc.member` event is present.
+    /// * `slot_id` - The slot ID from the `m.rtc.member` event.
+    /// * `member_id` - The `member.id` property of the user's own
+    ///   `m.rtc.member` event.
+    /// * `server_name` - The server name of the sender of the `m.rtc.member`
+    ///   event that advertised the SFU. If `None`, the homeserver uses its own
+    ///   server name.
+    ///
+    /// Homeservers that don't implement the endpoint respond with an
+    /// `M_UNRECOGNIZED` error.
+    pub async fn rtc_livekit_get_token(
+        &self,
+        url: String,
+        room_id: String,
+        slot_id: String,
+        member_id: String,
+        server_name: Option<String>,
+    ) -> Result<String, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        let server_name = server_name.map(ServerName::parse).transpose()?;
+        let response =
+            self.inner.rtc_livekit_get_token(url, room_id, slot_id, member_id, server_name).await?;
+        Ok(response.jwt)
+    }
+
+    /// Hand the delayed leave event of a MatrixRTC session over to the
+    /// homeserver, through its `/rtc/livekit/delegate_delayed_leave` endpoint
+    /// (MSC4195).
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The WebSocket URL of the LiveKit SFU that the user has
+    ///   connected to.
+    /// * `room_id` - The room where the `m.rtc.member` event is present.
+    /// * `slot_id` - The slot ID from the `m.rtc.member` event.
+    /// * `member_id` - The `member.id` property of the `m.rtc.member` event.
+    /// * `delay_id` - The ID of the delayed `m.rtc.member` leave event to
+    ///   delegate.
+    ///
+    /// Homeservers that don't implement the endpoint respond with an
+    /// `M_UNRECOGNIZED` error.
+    pub async fn rtc_livekit_delegate_delayed_leave(
+        &self,
+        url: String,
+        room_id: String,
+        slot_id: String,
+        member_id: String,
+        delay_id: String,
+    ) -> Result<(), ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        self.inner
+            .rtc_livekit_delegate_delayed_leave(url, room_id, slot_id, member_id, delay_id)
+            .await?;
+        Ok(())
     }
 
     /// Checks if the server supports the Profiles sliding sync extension.
@@ -2398,6 +2466,56 @@ impl Client {
     /// calling the `/_matrix/federation/v1/version` endpoint.
     pub async fn server_vendor_info(&self) -> Result<matrix_sdk::ServerVendorInfo, ClientError> {
         Ok(self.inner.server_vendor_info(None).await?)
+    }
+
+    /// Subscribe to changes in the room invite permission configuration.
+    pub async fn subscribe_to_invite_permission(
+        &self,
+        listener: Box<dyn InvitePermissionListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let (initial_value, stream) =
+            self.inner.account().observe_invite_permission_config().await?;
+
+        // Missing configuration is treated as unrestricted.
+        let state = initial_value
+            .map_or(InvitePermissionState::Unrestricted, |config| config.default_action.into());
+
+        // Send the initial value to the listener.
+        listener.on_change(state);
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            // Listen for changes and notify the listener.
+            let mut stream = pin!(stream);
+            while let Some(config) = stream.next().await {
+                listener.on_change(config.default_action.into());
+            }
+        }))))
+    }
+
+    /// Set the room invite permission for this account.
+    pub async fn set_invite_permission(
+        &self,
+        action: InvitePermissionAction,
+    ) -> Result<(), ClientError> {
+        let account = self.inner.account();
+
+        let mut config = account.fetch_invite_permission_config().await?.unwrap_or_default();
+
+        config.default_action = action.into();
+
+        account.set_invite_permission_config(config).await?;
+
+        Ok(())
+    }
+
+    /// Get the room invite permission stored in the cache.
+    ///
+    /// A missing configuration is treated as unrestricted.
+    pub async fn get_invite_permission(&self) -> Result<InvitePermissionState, ClientError> {
+        let config = self.inner.account().get_invite_permission_config().await?;
+
+        Ok(config
+            .map_or(InvitePermissionState::Unrestricted, |config| config.default_action.into()))
     }
 
     /// Subscribe to changes in the media preview configuration.
@@ -2650,6 +2768,97 @@ impl Client {
             }
         })))
     }
+
+    /// Subscribe to the total unread notification count of this [`Client`].
+    ///
+    /// The listener is called at most once every `min_interval` when new
+    /// [`RoomInfoNotableUpdate`] are received. This interval mode is to avoid
+    /// calculating hundreds of new values in a very small amount of time.
+    ///
+    /// An initial value will be reported as soon as the subscription starts.
+    ///
+    /// Use the returned [`TaskHandle`] to cancel the subscription.
+    pub fn observe_total_unread_notifications(
+        &self,
+        listener: Box<dyn TotalUnreadNotificationsListener>,
+        min_interval: Duration,
+    ) -> Arc<TaskHandle> {
+        let stream = self.inner.observe_total_unread_notifications(min_interval);
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            let mut stream = pin!(stream);
+
+            while let Some(total_count) = stream.next().await {
+                listener.on_update(total_count);
+            }
+        })))
+    }
+}
+
+/// A callback interface for receiving updates of the total unread notification
+/// count.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait TotalUnreadNotificationsListener: SyncOutsideWasm + SendOutsideWasm {
+    fn on_update(&self, count: u64);
+}
+
+/// What to do with a delayed event that hasn't been distributed to the room
+/// yet ([MSC4140]).
+///
+/// [MSC4140]: https://github.com/matrix-org/matrix-spec-proposals/pull/4140
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum DelayedEventUpdateAction {
+    /// Cancel the delayed event: it will never be sent to the room.
+    Cancel,
+    /// Restart the delay timeout, keeping the event scheduled.
+    Restart,
+    /// Send the event to the room right away.
+    Send,
+}
+
+impl From<DelayedEventUpdateAction> for UpdateAction {
+    fn from(value: DelayedEventUpdateAction) -> Self {
+        match value {
+            DelayedEventUpdateAction::Cancel => Self::Cancel,
+            DelayedEventUpdateAction::Restart => Self::Restart,
+            DelayedEventUpdateAction::Send => Self::Send,
+        }
+    }
+}
+
+#[matrix_sdk_ffi_macros::export]
+impl Client {
+    /// Cancel, restart or immediately send a previously scheduled delayed
+    /// event ([MSC4140]).
+    ///
+    /// # Arguments
+    ///
+    /// * `delay_id` - The identifier returned by [`Room::send_delayed_event`]
+    ///   or [`Room::send_delayed_state_event`].
+    ///
+    /// * `action` - What should happen to the delayed event.
+    ///
+    /// * `request_config_override` - Overrides the client's request config for
+    ///   this request. Fields that are not set keep the client's values.
+    ///
+    /// [MSC4140]: https://github.com/matrix-org/matrix-spec-proposals/pull/4140
+    /// [`Room::send_delayed_event`]: crate::room::Room::send_delayed_event
+    /// [`Room::send_delayed_state_event`]: crate::room::Room::send_delayed_state_event
+    #[uniffi::method(default(request_config_override = None))]
+    pub async fn update_delayed_event(
+        &self,
+        delay_id: String,
+        action: DelayedEventUpdateAction,
+        request_config_override: Option<RequestConfigOverride>,
+    ) -> Result<(), ClientError> {
+        let request_config = request_config_override.map(|request_config_override| {
+            request_config_override.apply_to(self.inner.request_config())
+        });
+
+        self.inner.update_delayed_event(delay_id, action.into(), request_config).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "unstable-msc4354")]
@@ -2887,6 +3096,11 @@ mod recent_emoji {
                 .collect::<Vec<RecentEmoji>>())
         }
     }
+}
+
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait InvitePermissionListener: SyncOutsideWasm + SendOutsideWasm {
+    fn on_change(&self, invite_permission: InvitePermissionState);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
@@ -3770,10 +3984,27 @@ impl TryFrom<RumaAllowRule> for AllowRule {
 /// Information about a MatrixRTC transport advertised by the homeserver.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum RtcTransport {
-    /// A LiveKit RTC transport.
+    /// A LiveKit RTC transport with the `m.livekit` type, as defined in the
+    /// merged state of MSC4195.
     LiveKit {
-        /// The URL of the LiveKit service.
-        service_url: String,
+        /// The WebSocket URL of the LiveKit SFU.
+        url: String,
+
+        /// The URL of the LiveKit JWT service.
+        ///
+        /// Deprecated in favor of `url`. Should only be used when backwards
+        /// compatibility with older versions of MSC4195 is required.
+        service_url: Option<String>,
+    },
+
+    /// A LiveKit RTC transport with the legacy `livekit` type, used by
+    /// implementations of earlier versions of MSC4195.
+    LegacyLiveKit {
+        /// The WebSocket URL of the LiveKit SFU.
+        url: Option<String>,
+
+        /// The URL of the LiveKit JWT service.
+        service_url: Option<String>,
     },
 
     /// A transport type the SDK doesn't know about, up for interpretation by
@@ -3789,10 +4020,16 @@ pub enum RtcTransport {
 }
 
 impl From<&RumaRtcTransport> for RtcTransport {
+    // `LegacyLiveKit` and `service_url` are deprecated, but still exposed for
+    // backwards compatibility.
+    #[allow(deprecated)]
     fn from(value: &RumaRtcTransport) -> Self {
         match value {
             RumaRtcTransport::LiveKit(info) => {
-                Self::LiveKit { service_url: info.service_url.clone() }
+                Self::LiveKit { url: info.url.clone(), service_url: info.service_url.clone() }
+            }
+            RumaRtcTransport::LegacyLiveKit(info) => {
+                Self::LegacyLiveKit { url: info.url.clone(), service_url: info.service_url.clone() }
             }
             _ => Self::Custom {
                 transport_type: value.transport_type().to_owned(),
@@ -3905,7 +4142,10 @@ mod tests {
 
     use ruma::{
         ServerName,
-        api::client::room::{Visibility, create_room},
+        api::client::{
+            room::{Visibility, create_room},
+            rtc::LiveKitRtcTransport,
+        },
         authentication::TokenType,
         events::StateEventType,
         room::RoomType,
@@ -4015,7 +4255,7 @@ mod tests {
         // reference to `ClientInner` is the local `sdk_client` variable.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let ffi_client = super::Client::new(sdk_client.clone(), None, None).await.unwrap();
+        let ffi_client = super::Client::new(sdk_client.clone(), None, None, None).await.unwrap();
 
         // Dropping `sdk_client` leaves `ffi_client` as the sole Arc holder of
         // `ClientInner` — mirroring what happens when the last JS reference to
@@ -4027,6 +4267,55 @@ mod tests {
         std::thread::spawn(move || drop(ffi_client))
             .join()
             .expect("Client::drop panicked on a non-tokio thread");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_clear_caches_deletes_the_store_files() {
+        use matrix_sdk::{Client, config::RequestConfig};
+        use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
+        use tempfile::tempdir;
+
+        let data_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+
+        let sdk_client = Client::builder()
+            .homeserver_url("https://example.com")
+            .request_config(RequestConfig::new().disable_retry())
+            .sqlite_store_with_cache_path(data_dir.path(), cache_dir.path(), None)
+            .cross_process_store_config(CrossProcessLockConfig::SingleProcess)
+            .build()
+            .await
+            .unwrap();
+        let client = super::Client::new(
+            sdk_client,
+            None,
+            Some(data_dir.path().to_owned()),
+            Some(cache_dir.path().to_owned()),
+        )
+        .await
+        .unwrap();
+
+        let crypto_store = data_dir.path().join("matrix-sdk-crypto.sqlite3");
+        let store_files = [
+            data_dir.path().join("matrix-sdk-state.sqlite3"),
+            cache_dir.path().join("matrix-sdk-event-cache.sqlite3"),
+            cache_dir.path().join("matrix-sdk-media.sqlite3"),
+        ];
+        assert!(crypto_store.exists());
+        for path in &store_files {
+            assert!(path.exists(), "{} doesn't exist", path.display());
+        }
+
+        client.clear_caches(None).await.unwrap();
+
+        assert!(crypto_store.exists());
+        for path in &store_files {
+            for suffix in ["", "-wal", "-shm"] {
+                let path = format!("{}{suffix}", path.display());
+                assert!(!std::path::Path::new(&path).exists(), "{path} wasn't removed");
+            }
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -4092,15 +4381,40 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_rtc_transport_conversion() {
-        use ruma::api::client::rtc::RtcTransport as RumaRtcTransport;
+        use ruma::api::client::rtc::{LegacyLiveKitRtcTransport, RtcTransport as RumaRtcTransport};
         use strass::assert_let;
 
         use super::RtcTransport;
 
-        let livekit = RumaRtcTransport::livekit("https://livekit.example.com".to_owned());
-        assert_let!(RtcTransport::LiveKit { service_url } = RtcTransport::from(&livekit));
-        assert_eq!(service_url, "https://livekit.example.com");
+        let mut transport = LiveKitRtcTransport::new("wss://livekit.example.com".to_owned());
+        transport.service_url = Some("https://livekit-jwt.example.com".to_owned());
+        let livekit = RumaRtcTransport::LiveKit(transport);
+        assert_let!(RtcTransport::LiveKit { url, service_url } = RtcTransport::from(&livekit));
+        assert_eq!(url, "wss://livekit.example.com");
+        assert_eq!(service_url.as_deref(), Some("https://livekit-jwt.example.com"));
+
+        // The legacy `livekit` transport type keeps its own variant.
+        let legacy_livekit =
+            RumaRtcTransport::LegacyLiveKit(LegacyLiveKitRtcTransport::with_service_url(
+                "https://livekit-jwt.example.com".to_owned(),
+            ));
+        assert_let!(
+            RtcTransport::LegacyLiveKit { url, service_url } = RtcTransport::from(&legacy_livekit)
+        );
+        assert_eq!(url, None);
+        assert_eq!(service_url.as_deref(), Some("https://livekit-jwt.example.com"));
+
+        // A legacy `livekit` transport naming only its SFU url is still legacy.
+        let legacy_livekit = RumaRtcTransport::LegacyLiveKit(LegacyLiveKitRtcTransport::new(
+            "wss://livekit.example.com".to_owned(),
+        ));
+        assert_let!(
+            RtcTransport::LegacyLiveKit { url, service_url } = RtcTransport::from(&legacy_livekit)
+        );
+        assert_eq!(url.as_deref(), Some("wss://livekit.example.com"));
+        assert_eq!(service_url, None);
 
         let custom = RumaRtcTransport::new(
             "com.example.custom",

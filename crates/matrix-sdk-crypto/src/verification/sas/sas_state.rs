@@ -393,8 +393,8 @@ pub struct Accepted {
     commitment: Base64,
 }
 
-/// The SAS state we're going to be in after we accepted our verification start
-/// event.
+/// The SAS state we're going to be in after we accepted the other side's
+/// verification start event.
 #[derive(Clone, Debug)]
 pub struct WeAccepted {
     we_started: bool,
@@ -402,10 +402,9 @@ pub struct WeAccepted {
     commitment: Base64,
 }
 
-/// The SAS state we're going to be in after we received the public key of the
-/// other participant.
-///
-/// From now on we can show the short auth string to the user.
+/// The SAS state we're going to be in after we accepted the verification start
+/// event, and then received the public key of the other participant. We will
+/// send our own `m.key.verification.key` message.
 #[derive(Clone, Debug)]
 pub struct KeyReceived {
     sas: Arc<Mutex<EstablishedSas>>,
@@ -414,6 +413,8 @@ pub struct KeyReceived {
     pub accepted_protocols: AcceptedProtocols,
 }
 
+/// The SAS state which we will be in after the other side accepted our
+/// verification start event, and we sent our keys.
 #[derive(Clone, Debug)]
 pub struct KeySent {
     we_started: bool,
@@ -422,6 +423,11 @@ pub struct KeySent {
     pub accepted_protocols: AcceptedProtocols,
 }
 
+/// The SAS state which we will be in after we have both sent and received
+/// public keys.
+///
+/// Once we are in this state, we can show the SAS string and wait for the user
+/// to confirm.
 #[derive(Clone, Debug)]
 pub struct KeysExchanged {
     sas: Arc<Mutex<EstablishedSas>>,
@@ -965,7 +971,7 @@ impl SasState<Accepted> {
                 }),
             })
         } else {
-            Err(self.cancel(true, CancelCode::KeyMismatch))
+            Err(self.cancel(true, CancelCode::MismatchedCommitment))
         }
     }
 
@@ -1050,7 +1056,7 @@ impl SasState<KeySent> {
                 }),
             })
         } else {
-            Err(self.cancel(true, CancelCode::KeyMismatch))
+            Err(self.cancel(true, CancelCode::MismatchedCommitment))
         }
     }
 }
@@ -1505,6 +1511,7 @@ mod tests {
             HashAlgorithm, KeyAgreementProtocol, MessageAuthenticationCode,
             ShortAuthenticationString,
             accept::{AcceptMethod, ToDeviceKeyVerificationAcceptEventContent},
+            cancel::CancelCode,
             start::{
                 SasV1Content, SasV1ContentInit, StartMethod,
                 ToDeviceKeyVerificationStartEventContent,
@@ -1514,13 +1521,14 @@ mod tests {
         user_id,
     };
     use serde_json::json;
+    use strass::assert_let;
 
     use super::{Accepted, Created, SasState, Started, SupportedMacMethod, WeAccepted};
     use crate::{
         AcceptedProtocols, Account, DeviceData,
         verification::{
             FlowId,
-            event_enums::{AcceptContent, KeyContent, MacContent, StartContent},
+            event_enums::{AcceptContent, CancelContent, KeyContent, MacContent, StartContent},
         },
     };
 
@@ -1759,9 +1767,48 @@ mod tests {
         let content = bob.as_content();
         let content = KeyContent::try_from(&content.0).unwrap();
 
-        alice
+        let alice = alice
             .into_key_received(bob.user_id(), &content)
             .expect_err("Didn't cancel on invalid commitment");
+
+        assert_eq!(alice.state.cancel_code, CancelCode::MismatchedCommitment);
+
+        let content = alice.as_content();
+        let content = CancelContent::try_from(&content).unwrap();
+        assert_eq!(content.cancel_code(), &CancelCode::MismatchedCommitment);
+    }
+
+    #[test]
+    fn test_sas_invalid_commitment_after_key_sent() {
+        let (alice, bob) = get_sas_pair(None);
+
+        let mut content = bob.as_content();
+        assert_let!(AcceptMethod::SasV1(c) = content.method_mut());
+        c.commitment = Base64::empty();
+
+        let content = AcceptContent::from(&content);
+
+        let alice: SasState<Accepted> = alice.into_accepted(bob.user_id(), &content).unwrap();
+
+        let content = alice.as_content();
+        let request_id = content.1.request_id;
+        let content = KeyContent::try_from(&content.0).unwrap();
+
+        let alice = alice.into_key_sent(&request_id).unwrap();
+        let bob = bob.into_key_received(alice.user_id(), &content).unwrap();
+
+        let (content, _) = bob.as_content();
+        let content = KeyContent::try_from(&content).unwrap();
+
+        let alice = alice
+            .into_keys_exchanged(bob.user_id(), &content)
+            .expect_err("Didn't cancel on invalid commitment");
+
+        assert_eq!(alice.state.cancel_code, CancelCode::MismatchedCommitment);
+
+        let content = alice.as_content();
+        let content = CancelContent::try_from(&content).unwrap();
+        assert_eq!(content.cancel_code(), &CancelCode::MismatchedCommitment);
     }
 
     #[test]
