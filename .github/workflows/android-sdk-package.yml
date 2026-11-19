@@ -1,4 +1,4 @@
-name: Publish custom Android Rust SDK
+name: Publish fork Android Rust SDK
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       version:
-        description: Unused Maven version (26.09.9-custom.N)
+        description: Unused Maven version (26.09.9-fork.N)
         required: true
         type: string
       publish:
@@ -39,7 +39,7 @@ jobs:
           SDK_VERSION: ${{ inputs.version }}
         run: |
           [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ && "$TESTED_SHA" == "$GITHUB_SHA" ]]
-          [[ "$SDK_VERSION" =~ ^26\.09\.9-custom\.[1-9][0-9]*$ ]]
+          [[ "$SDK_VERSION" =~ ^26\.09\.9-fork\.[1-9][0-9]*$ ]]
 
       - name: Checkout Rust SDK source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
