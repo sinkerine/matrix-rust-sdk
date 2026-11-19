@@ -785,7 +785,7 @@ async fn test_send_reply_with_extra_content() {
             assert_eq!(body["m.relates_to"]["m.in_reply_to"]["event_id"], target.as_str());
             assert!(body["m.relates_to"].get("rel_type").is_none());
             assert_eq!(body["org.matrix.msc4391.command"], expected_command);
-            assert_eq!(body["m.mentions"], json!({ "user_ids": [CAROL.as_str()] }));
+            assert_eq!(body["m.mentions"], json!({ "user_ids": [User::Carol.as_str()] }));
             ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$reply_event" }))
         })
         .expect(1)
@@ -795,7 +795,7 @@ async fn test_send_reply_with_extra_content() {
     timeline
         .send_reply_with_extra_content(
             RoomMessageEventContentWithoutRelation::text_plain("/model gpt-5")
-                .add_mentions(Mentions::with_user_ids([CAROL.to_owned()])),
+                .add_mentions(Mentions::with_user_ids([User::Carol.into()])),
             target.to_owned(),
             AddMentions::No,
             Some(serde_json::Map::from_iter([("org.matrix.msc4391.command".to_owned(), command)])),
@@ -1367,7 +1367,7 @@ async fn test_send_reply_with_extra_content_in_thread() {
                 assert!(!thread.is_falling_back);
             });
             assert_eq!(body["org.matrix.msc4391.command"], expected_command);
-            assert_eq!(body["m.mentions"], json!({ "user_ids": [CAROL.as_str()] }));
+            assert_eq!(body["m.mentions"], json!({ "user_ids": [User::Carol.as_str()] }));
             ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$reply_event" }))
         })
         .expect(1)
@@ -1377,7 +1377,7 @@ async fn test_send_reply_with_extra_content_in_thread() {
     thread_timeline
         .send_reply_with_extra_content(
             RoomMessageEventContentWithoutRelation::text_plain("/model gpt-5")
-                .add_mentions(Mentions::with_user_ids([CAROL.to_owned()])),
+                .add_mentions(Mentions::with_user_ids([User::Carol.into()])),
             target.to_owned(),
             AddMentions::No,
             Some(serde_json::Map::from_iter([("org.matrix.msc4391.command".to_owned(), command)])),
